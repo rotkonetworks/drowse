@@ -45,6 +45,14 @@ pub trait Collector: Send {
     fn fields(&self) -> &[Field];
     /// Write one value per field into `out` (`out.len() == fields().len()`).
     fn sample(&mut self, out: &mut [u64]) -> io::Result<()>;
+    /// Sample every Nth engine tick (default: every tick). A collector whose
+    /// read is expensive or wakes hardware (EC-backed battery attributes,
+    /// anything firmware-mediated) declares a sparser cadence; on skipped
+    /// ticks its previous values carry forward (gauges persist, counter
+    /// deltas read 0).
+    fn cadence(&self) -> u32 {
+        1
+    }
 }
 
 /// Probe outcome: an unavailable source is a value, not an error.
@@ -100,8 +108,10 @@ impl Engine {
         }
     }
 
-    /// Sample every collector once. `now_ns` is CLOCK_BOOTTIME.
-    /// Allocation-free after construction.
+    /// Sample every due collector once. `now_ns` is CLOCK_BOOTTIME.
+    /// Allocation-free after construction. A collector whose `cadence` is N
+    /// is read on every Nth tick (and always on the first); in between, its
+    /// previous values carry forward.
     pub fn tick(&mut self, now_ns: u64) -> io::Result<()> {
         std::mem::swap(&mut self.prev, &mut self.curr);
         self.prev_ns = self.curr_ns;
@@ -109,7 +119,12 @@ impl Engine {
         for (i, c) in self.collectors.iter_mut().enumerate() {
             let start = self.offsets[i];
             let end = start + c.fields().len();
-            c.sample(&mut self.curr[start..end])?;
+            let cadence = u64::from(c.cadence().max(1));
+            if self.ticks % cadence == 0 {
+                c.sample(&mut self.curr[start..end])?;
+            } else {
+                self.curr[start..end].copy_from_slice(&self.prev[start..end]);
+            }
         }
         self.ticks += 1;
         Ok(())
@@ -175,6 +190,39 @@ mod tests {
             out[1] = 42; // gauge
             Ok(())
         }
+    }
+
+    struct Slow {
+        fields: Vec<Field>,
+        samples: u64,
+    }
+    impl Collector for Slow {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn fields(&self) -> &[Field] {
+            &self.fields
+        }
+        fn cadence(&self) -> u32 {
+            3
+        }
+        fn sample(&mut self, out: &mut [u64]) -> io::Result<()> {
+            self.samples += 1;
+            out[0] = self.samples * 100; // gauge changes each real sample
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cadence_skips_and_carries_forward() {
+        let fields = vec![Field { name: "g".into(), kind: Kind::Gauge, unit: Unit::Count }];
+        let mut e = Engine::new(vec![Probe::Ready(Box::new(Slow { fields, samples: 0 }))]);
+        for t in 0..7u64 {
+            e.tick(t * 1_000).unwrap();
+        }
+        // Sampled on ticks 0, 3, 6 -> 3 real reads; value carried in between.
+        let v = e.values().next().unwrap().value;
+        assert_eq!(v, Some(300));
     }
 
     #[test]

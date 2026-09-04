@@ -1,0 +1,157 @@
+//! Daemon state: engine + sessions + tick history + subscribers. All state
+//! transitions live here as plain methods so the RPC handlers stay thin and
+//! unit-testable without a socket.
+
+use crate::score::{self, FieldInfo, SysInfo, TickRecord};
+use drowse_api::{Scorecard, SourceStatus};
+use drowse_core::Engine;
+use std::collections::{BTreeMap, VecDeque};
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Keep at most this many completed ticks (~20 min at 2 s cadence).
+const HISTORY_CAP: usize = 720;
+
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub interval_ms: u64,
+    pub started_unix_ms: u64,
+}
+
+pub struct State {
+    pub engine: Engine,
+    pub layout: Vec<FieldInfo>,
+    pub history: VecDeque<TickRecord>,
+    pub sessions: BTreeMap<String, SessionInfo>,
+    /// Connection ids subscribed to per-tick notifications.
+    pub subscribers: BTreeMap<u64, ()>,
+    /// Connection currently being served; set by the transport around each
+    /// dispatch so `subscribe` knows who called.
+    pub current_conn: Option<u64>,
+    next_id: u64,
+    pub sysinfo: SysInfo,
+}
+
+impl State {
+    pub fn new(engine: Engine, sysinfo: SysInfo) -> State {
+        let layout = score::layout_of(&engine);
+        State {
+            engine,
+            layout,
+            history: VecDeque::new(),
+            sessions: BTreeMap::new(),
+            subscribers: BTreeMap::new(),
+            current_conn: None,
+            next_id: 0,
+            sysinfo,
+        }
+    }
+
+    // -- sessions -----------------------------------------------------------
+
+    /// Idempotent: a caller-supplied id that already exists returns the
+    /// existing session unchanged, `created = false`.
+    pub fn start_session(
+        &mut self,
+        id: Option<String>,
+        interval_ms: u64,
+    ) -> (SessionInfo, bool) {
+        let id = id.unwrap_or_else(|| {
+            self.next_id += 1;
+            format!("s{}", self.next_id)
+        });
+        if let Some(existing) = self.sessions.get(&id) {
+            return (existing.clone(), false);
+        }
+        let info = SessionInfo { id: id.clone(), interval_ms, started_unix_ms: unix_ms() };
+        self.sessions.insert(id, info.clone());
+        (info, true)
+    }
+
+    /// Idempotent: returns `already_stopped = true` for unknown/stopped ids.
+    pub fn stop_session(&mut self, id: &str) -> bool {
+        self.sessions.remove(id).is_none()
+    }
+
+    /// N sessions share one sampler: tick at the minimum requested interval.
+    pub fn min_interval_ms(&self) -> Option<u64> {
+        self.sessions.values().map(|s| s.interval_ms).min()
+    }
+
+    // -- sampling -----------------------------------------------------------
+
+    /// Sample all collectors. Records a delta tick once two samples exist.
+    /// Returns true if a record was appended.
+    pub fn tick_now(&mut self, now_ns: u64, unix_ms: u64) -> io::Result<bool> {
+        self.engine.tick(now_ns)?;
+        if !self.engine.ready() {
+            return Ok(false);
+        }
+        self.history.push_back(score::record(&self.engine, unix_ms));
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
+        Ok(true)
+    }
+
+    /// Two inline samples 1 s apart, for `score.get` with no session running.
+    /// Blocks the caller (single-threaded daemon: the whole loop) for ~1 s.
+    pub fn one_shot(&mut self) -> io::Result<TickRecord> {
+        self.engine.tick(boottime_ns())?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        self.engine.tick(boottime_ns())?;
+        Ok(score::record(&self.engine, unix_ms()))
+    }
+
+    /// Trailing records covering `window_s`, chronological, possibly empty.
+    pub fn window_records(&self, window_s: f64) -> Vec<&TickRecord> {
+        let window_ns = (window_s.max(0.0) * 1e9) as u64;
+        let mut acc = 0u64;
+        let mut out: Vec<&TickRecord> = Vec::new();
+        for r in self.history.iter().rev() {
+            if acc >= window_ns && !out.is_empty() {
+                break;
+            }
+            acc += r.elapsed_ns;
+            out.push(r);
+        }
+        out.reverse();
+        out
+    }
+
+    pub fn make_scorecard(&self, records: &[&TickRecord]) -> Scorecard {
+        score::assemble(&self.layout, records, &self.engine.unavailable, &self.sysinfo)
+    }
+
+    /// Params for the per-tick "tick" notification, from the latest record.
+    pub fn make_tick_params(&self) -> Option<serde_json::Value> {
+        let last = self.history.back()?;
+        let sc = self.make_scorecard(&[last]);
+        Some(serde_json::json!({ "scorecard": sc }))
+    }
+
+    /// Source availability for `system.check`: ready collectors + probe
+    /// failures, no sampling required.
+    pub fn sources_now(&self) -> BTreeMap<String, SourceStatus> {
+        let mut out = self.engine.unavailable.clone();
+        for f in &self.layout {
+            out.entry(f.collector.to_string()).or_insert_with(SourceStatus::ok);
+        }
+        out
+    }
+}
+
+pub fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// CLOCK_BOOTTIME in nanoseconds: monotonic across suspend, so deltas over a
+/// sleep are rated against real wall time.
+pub fn boottime_ns() -> u64 {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
