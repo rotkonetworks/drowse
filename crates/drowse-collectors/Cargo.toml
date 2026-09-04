@@ -1,0 +1,11 @@
+[package]
+name = "drowse-collectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sysfs/procfs collectors: cpuidle, RAPL, battery, amdgpu."
+
+[dependencies]
+drowse-api.workspace = true
+drowse-core.workspace = true
+rustix.workspace = true

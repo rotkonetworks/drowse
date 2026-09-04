@@ -1,0 +1,12 @@
+[package]
+name = "drowse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Collector trait, sampling engine, and the sync service stack."
+
+[dependencies]
+drowse-api.workspace = true
+serde_json.workspace = true
+tower-service = "0.3"
+tower-layer = "0.3"

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/drowse-api",
+    "crates/drowse-core",
+    "crates/drowse-collectors",
+    "crates/drowsed",
+    "crates/drowse",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustix = { version = "1", features = ["fs", "time", "event", "net", "process", "pipe"] }
+drowse-api = { path = "crates/drowse-api" }
+drowse-core = { path = "crates/drowse-core" }
+drowse-collectors = { path = "crates/drowse-collectors" }
+
+[profile.release]
+lto = true
+strip = true

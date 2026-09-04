@@ -1,0 +1,10 @@
+[package]
+name = "drowse-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The drowse wire contract: every object an agent sees, nothing else."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "drowse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The drowse CLI: agent-first client for drowsed."
+
+[dependencies]
+drowse-api.workspace = true
+serde_json.workspace = true
+rustix.workspace = true

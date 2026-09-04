@@ -1,0 +1,13 @@
+[package]
+name = "drowsed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The drowse daemon: sampler + JSON-RPC control socket."
+
+[dependencies]
+drowse-api.workspace = true
+drowse-core.workspace = true
+drowse-collectors.workspace = true
+serde_json.workspace = true
+rustix.workspace = true
