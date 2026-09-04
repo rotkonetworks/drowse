@@ -8,15 +8,12 @@
 //! Ignored by default (needs ~25 s of wall time and a quiet scheduler):
 //!   cargo test -p drowsed --test self_footprint -- --ignored
 //!
-//! This exercises the REAL collector stack on the host, so a failure indicts
-//! whichever collector blocks the sampling thread — not just the transport.
-//! To isolate the transport, run against a synthetic fixture root with only
-//! cpuidle (`drowsed --root <fixture>`); that path measures ~1 switch/tick.
-//! As of this writing the live check fails on EC-bound laptops because the
-//! battery collector's `power_now` pread wakes the embedded controller (~4.5
-//! ms, ~25 voluntary switches) every tick — see the report. The fix belongs
-//! in drowse-collectors / the engine (sample slow battery gauges at a
-//! sub-cadence), not here.
+//! This exercises the REAL collector stack on the host. The ppoll sampler
+//! thread reads only the cheap collectors (cpuidle/amdgpu/rapl); the EC-bound
+//! battery collector runs on the slow-lane thread, whose context switches
+//! accrue to a different TID and so do not appear in /proc/<pid>/status (that
+//! path reports the main thread's task counters, verified). The test also
+//! asserts battery stays fresh, so the slow lane cannot silently freeze.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -49,8 +46,16 @@ fn wakeup_rate_at_most_1_1_per_tick() {
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("sock");
 
+    // Slow lane cadence 1 s: battery is read on its own thread (off the ppoll
+    // sampler), so this does NOT count against the fast-thread budget measured
+    // below, and it makes battery freshness observable inside the test window.
     let child = Command::new(env!("CARGO_BIN_EXE_drowsed"))
-        .args(["--socket", sock.to_str().unwrap()])
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "--slow-cadence-ms",
+            "1000",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null()) // per-tick log must not block on a full pipe
         .spawn()
@@ -67,22 +72,39 @@ fn wakeup_rate_at_most_1_1_per_tick() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let mut stream = stream.expect("daemon socket did not appear");
-
-    // One 2 s session; then leave the connection completely idle.
-    stream
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session.start\",\
-              \"params\":{\"session_id\":\"fp\",\"interval_ms\":2000}}\n",
-        )
-        .unwrap();
+    let stream = stream.expect("daemon socket did not appear");
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    assert!(line.contains("\"created\":true"), "session.start reply: {line}");
+    let mut w = stream;
 
-    // Settle past the prime tick and rearm churn, then measure 10 ticks.
+    let mut next_id = 0u64;
+    let mut call = |w: &mut UnixStream, method: &str, params: &str| -> String {
+        next_id += 1;
+        let frame = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{next_id},\"method\":\"{method}\",\"params\":{params}}}\n"
+        );
+        w.write_all(frame.as_bytes()).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line
+    };
+
+    // One 2 s session; the slow lane starts sampling battery every 1 s.
+    let started = call(&mut w, "session.start", "{\"session_id\":\"fp\",\"interval_ms\":2000}");
+    assert!(started.contains("\"created\":true"), "session.start reply: {started}");
+
+    // Settle past the prime tick and rearm churn.
     std::thread::sleep(Duration::from_secs(3));
+
+    // Freshness, reading 1: battery must be present and its source `ok`
+    // (published within the staleness window = 3x cadence).
+    let sc1 = call(&mut w, "score.get", "{\"window_s\":10}");
+    assert!(
+        sc1.contains("\"battery\":{\"state\":\"ok\"}"),
+        "battery source not fresh at t=3s: {sc1}"
+    );
+    assert!(sc1.contains("\"power_w\":"), "battery value missing at t=3s: {sc1}");
+
+    // ---- fast-thread wakeup budget over 10 ticks --------------------------
     let v1 = voluntary_ctxt_switches(pid);
     const TICKS: u64 = 10;
     std::thread::sleep(Duration::from_secs(2 * TICKS));
@@ -94,6 +116,14 @@ fn wakeup_rate_at_most_1_1_per_tick() {
     assert!(
         rate <= 1.1,
         "drowsed woke {rate:.2} times per tick (limit 1.1) — the daemon is hurting the battery"
+    );
+
+    // Freshness, reading 2 (~20 s later): still `ok` proves the slow lane kept
+    // publishing — it did not silently freeze after the first sample.
+    let sc2 = call(&mut w, "score.get", "{\"window_s\":10}");
+    assert!(
+        sc2.contains("\"battery\":{\"state\":\"ok\"}"),
+        "battery source went stale — slow lane froze: {sc2}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

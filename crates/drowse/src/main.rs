@@ -268,7 +268,7 @@ fn send_request(
     line.push('\n');
     stream
         .write_all(line.as_bytes())
-        .map_err(|e| daemon_lost(e))
+        .map_err(daemon_lost)
 }
 
 fn daemon_lost(e: std::io::Error) -> Fail {

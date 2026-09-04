@@ -20,12 +20,18 @@ use rustix::time::{
     timerfd_create, timerfd_settime, Itimerspec, TimerfdClockId, TimerfdFlags,
     TimerfdTimerFlags, Timespec,
 };
+use drowse_core::{Collector, Engine, Probe};
 use state::{boottime_ns, unix_ms, State};
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Default slow-lane cadence: battery gauges change slowly, and each read
+/// stalls on the EC, so it is read far less often than the fast tick.
+const DEFAULT_SLOW_CADENCE_MS: u64 = 10_000;
 
 /// Notifications are dropped (never block the sampler) once a client's
 /// outgoing buffer exceeds this.
@@ -95,6 +101,7 @@ impl Drop for SocketGuard {
 fn main() {
     let mut socket_path = drowse_api::user_socket_path();
     let mut root = PathBuf::from("/");
+    let mut slow_cadence_ms = DEFAULT_SLOW_CADENCE_MS;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -106,13 +113,18 @@ fn main() {
                 Some(p) => root = PathBuf::from(p),
                 None => die_usage("--root requires a path"),
             },
+            "--slow-cadence-ms" => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) if n >= 100 => slow_cadence_ms = n,
+                _ => die_usage("--slow-cadence-ms requires an integer >= 100"),
+            },
             "--help" | "-h" => {
                 println!(
                     "drowsed - drowse sampling daemon (JSON-RPC 2.0, newline-delimited)\n\n\
-                     USAGE: drowsed [--socket PATH] [--root PATH]\n\n\
+                     USAGE: drowsed [--socket PATH] [--root PATH] [--slow-cadence-ms N]\n\n\
                      OPTIONS:\n  \
-                     --socket PATH  control socket (default: $XDG_RUNTIME_DIR/drowsed.sock)\n  \
-                     --root PATH    sysfs root, for fixture testing (default: /)"
+                     --socket PATH        control socket (default: $XDG_RUNTIME_DIR/drowsed.sock)\n  \
+                     --root PATH          sysfs root, for fixture testing (default: /)\n  \
+                     --slow-cadence-ms N  slow-lane (battery) sampling period (default: 10000)"
                 );
                 return;
             }
@@ -120,7 +132,7 @@ fn main() {
         }
     }
 
-    if let Err(e) = run(&socket_path, &root) {
+    if let Err(e) = run(&socket_path, &root, slow_cadence_ms) {
         eprintln!("drowsed: fatal: {e}");
         std::process::exit(drowse_api::ErrorCode::Internal.exit_code());
     }
@@ -143,7 +155,29 @@ fn sysinfo() -> score::SysInfo {
     }
 }
 
-fn run(socket_path: &Path, root: &Path) -> std::io::Result<()> {
+/// Latency classifier. High-latency, hardware-waking collectors (the battery
+/// EC gauges) go to the slow lane so the fast tick never blocks. The class is
+/// the collector's own declaration — no name knowledge here.
+fn is_slow(c: &dyn Collector) -> bool {
+    c.latency() == drowse_core::Latency::Slow
+}
+
+/// Split probes into (fast, slow). Unavailable probes stay on the fast side so
+/// their typed status still surfaces in the sources map; only Ready collectors
+/// classified Slow move to the slow lane.
+fn partition_probes(probes: Vec<Probe>) -> (Vec<Probe>, Vec<Probe>) {
+    let mut fast = Vec::new();
+    let mut slow = Vec::new();
+    for p in probes {
+        match &p {
+            Probe::Ready(c) if is_slow(c.as_ref()) => slow.push(p),
+            _ => fast.push(p),
+        }
+    }
+    (fast, slow)
+}
+
+fn run(socket_path: &Path, root: &Path, slow_cadence_ms: u64) -> std::io::Result<()> {
     // Refuse to steal a live socket; replace a stale one.
     if socket_path.exists() {
         if UnixStream::connect(socket_path).is_ok() {
@@ -153,9 +187,26 @@ fn run(socket_path: &Path, root: &Path) -> std::io::Result<()> {
         std::fs::remove_file(socket_path)?;
     }
 
-    let engine = drowse_core::Engine::new(drowse_collectors::probe_all(root));
-    let st = Arc::new(Mutex::new(State::new(engine, sysinfo())));
+    let (fast_probes, slow_probes) = partition_probes(drowse_collectors::probe_all(root));
+    let has_slow = slow_probes.iter().any(|p| matches!(p, Probe::Ready(_)));
+    let fast_engine = Engine::new(fast_probes);
+    let slow_engine = Engine::new(slow_probes);
+    let slow_layout = score::layout_of(&slow_engine);
+
+    let st = Arc::new(Mutex::new(State::new(
+        fast_engine,
+        slow_layout,
+        slow_cadence_ms,
+        sysinfo(),
+    )));
     let mut svc = rpc::service(st.clone());
+
+    // The slow lane parks on this until a session exists, so an idle daemon
+    // wakes neither the fast (ppoll) nor the slow thread.
+    let slow_wake = Arc::new(Condvar::new());
+    if has_slow {
+        spawn_slow_lane(st.clone(), slow_wake.clone(), slow_engine, slow_cadence_ms);
+    }
 
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
@@ -269,7 +320,62 @@ fn run(socket_path: &Path, root: &Path) -> std::io::Result<()> {
             clients.remove(&id);
             st.lock().unwrap().subscribers.remove(&id);
         }
+
+        // 5. A request may have started the first session; wake the slow lane
+        // out of its idle park. (No-op while it is already running.)
+        if st.lock().unwrap().min_interval_ms().is_some() {
+            slow_wake.notify_all();
+        }
     }
+}
+
+/// The slow lane: a dedicated thread owning the high-latency collectors. It
+/// reads them on its own cadence and publishes the latest values into shared
+/// `State`, so the ppoll sampler thread never blocks on an EC/SMU stall. Its
+/// own wakeups are rare (~1 per cadence) and accrue to this thread, not the
+/// fast one. It parks entirely while no session exists.
+fn spawn_slow_lane(
+    st: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    mut engine: Engine,
+    cadence_ms: u64,
+) {
+    let publish = move |engine: &mut Engine, st: &Arc<Mutex<State>>| {
+        // Sample OFF the lock: the EC stall happens here, on this thread only.
+        let t = Instant::now();
+        if let Err(e) = engine.tick(boottime_ns()) {
+            eprintln!("drowsed: slow-lane tick failed: {e}");
+        }
+        let values: Vec<Option<u64>> = engine.values().map(|s| s.value).collect();
+        eprintln!("drowsed: slow-lane sampled in {}us", t.elapsed().as_micros());
+        st.lock().unwrap().publish_slow(values, unix_ms());
+    };
+
+    std::thread::Builder::new()
+        .name("drowse-slow".into())
+        .spawn(move || {
+            // Prime once at startup so battery is available to a no-session
+            // one-shot `score.get` before any session exists.
+            publish(&mut engine, &st);
+            loop {
+                // Park (zero wakeups) until at least one session is running.
+                {
+                    let guard = st.lock().unwrap();
+                    let _g = wake
+                        .wait_while(guard, |s| s.sessions.is_empty())
+                        .unwrap();
+                }
+                // Active: sample every cadence until the last session stops.
+                loop {
+                    publish(&mut engine, &st);
+                    std::thread::sleep(Duration::from_millis(cadence_ms));
+                    if st.lock().unwrap().sessions.is_empty() {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn slow lane thread");
 }
 
 /// Pure timer policy: what the timerfd should be set to for a desired
@@ -309,10 +415,10 @@ fn rearm_if_needed(
             // Prime the engine so the first timer expiry yields a delta.
             {
                 let mut s = st.lock().unwrap();
-                if s.engine.ticks() == 0 {
-                    if let Err(e) = s.tick_now(boottime_ns(), unix_ms()) {
-                        eprintln!("drowsed: prime tick failed: {e}");
-                    }
+                if s.engine.ticks() == 0
+                    && let Err(e) = s.tick_now(boottime_ns(), unix_ms())
+                {
+                    eprintln!("drowsed: prime tick failed: {e}");
                 }
             }
             timerfd_settime(

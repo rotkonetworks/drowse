@@ -17,6 +17,7 @@ pub struct SysInfo {
 
 /// Owned copy of the engine's field layout, captured once after probe.
 /// Index-aligned with [`TickRecord::values`].
+#[derive(Clone)]
 pub struct FieldInfo {
     pub collector: &'static str,
     pub name: String,

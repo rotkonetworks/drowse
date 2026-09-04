@@ -20,8 +20,12 @@ pub struct SessionInfo {
 }
 
 pub struct State {
+    /// Fast lane: cheap collectors (cpuidle, amdgpu, rapl) sampled on the
+    /// ppoll thread every tick. High-latency collectors (battery) live in the
+    /// slow lane and never touch this engine.
     pub engine: Engine,
-    pub layout: Vec<FieldInfo>,
+    /// fast layout ++ slow layout; the axis `make_scorecard` assembles over.
+    pub combined_layout: Vec<FieldInfo>,
     pub history: VecDeque<TickRecord>,
     pub sessions: BTreeMap<String, SessionInfo>,
     /// Connection ids subscribed to per-tick notifications.
@@ -31,21 +35,60 @@ pub struct State {
     pub current_conn: Option<u64>,
     next_id: u64,
     pub sysinfo: SysInfo,
+
+    // -- slow lane: latest values published by the slow-lane thread ----------
+    /// Field layout of the slow collectors (fixed after probe).
+    pub slow_layout: Vec<FieldInfo>,
+    /// Latest slow values, index-aligned with `slow_layout`. `None` per field
+    /// until the slow lane has produced a valid sample for it.
+    pub slow_values: Vec<Option<u64>>,
+    /// Wall-clock ms of the last slow publish; 0 = never. Drives staleness.
+    pub slow_unix_ms: u64,
+    /// The slow lane's cadence; staleness threshold is 3x this.
+    pub slow_cadence_ms: u64,
 }
 
 impl State {
-    pub fn new(engine: Engine, sysinfo: SysInfo) -> State {
-        let layout = score::layout_of(&engine);
+    pub fn new(
+        engine: Engine,
+        slow_layout: Vec<FieldInfo>,
+        slow_cadence_ms: u64,
+        sysinfo: SysInfo,
+    ) -> State {
+        let mut combined_layout: Vec<FieldInfo> = score::layout_of(&engine);
+        combined_layout.extend(slow_layout.iter().cloned());
+        let slow_values = vec![None; slow_layout.len()];
         State {
             engine,
-            layout,
+            combined_layout,
             history: VecDeque::new(),
             sessions: BTreeMap::new(),
             subscribers: BTreeMap::new(),
             current_conn: None,
             next_id: 0,
             sysinfo,
+            slow_layout,
+            slow_values,
+            slow_unix_ms: 0,
+            slow_cadence_ms,
         }
+    }
+
+    /// Publish a fresh batch of slow-lane values (called by the slow thread,
+    /// off the sampler critical path). `len` must equal `slow_layout.len()`.
+    pub fn publish_slow(&mut self, values: Vec<Option<u64>>, unix_ms: u64) {
+        debug_assert_eq!(values.len(), self.slow_layout.len());
+        self.slow_values = values;
+        self.slow_unix_ms = unix_ms;
+    }
+
+    /// Slow data is fresh if it was published within 3x the slow cadence of
+    /// `now_ms`. A frozen slow lane goes stale and its fields degrade rather
+    /// than being reported as current — the anti-freeze guard.
+    pub fn slow_fresh(&self, now_ms: u64) -> bool {
+        self.slow_unix_ms != 0
+            && now_ms.saturating_sub(self.slow_unix_ms)
+                <= self.slow_cadence_ms.saturating_mul(3)
     }
 
     // -- sessions -----------------------------------------------------------
@@ -120,8 +163,28 @@ impl State {
         out
     }
 
+    /// Assemble a scorecard from fast-lane `records`, merging the slow lane's
+    /// latest published values. The slow snapshot (battery gauges) is appended
+    /// to the most recent record only — gauges are read from their last valid
+    /// tick, so one carrier record suffices and the others stay short (slow
+    /// columns then read as absent for them, which assemble handles). When the
+    /// slow lane is stale, the snapshot is withheld and battery degrades.
     pub fn make_scorecard(&self, records: &[&TickRecord]) -> Scorecard {
-        score::assemble(&self.layout, records, &self.engine.unavailable, &self.sysinfo)
+        let now_ms = records.last().map(|r| r.unix_ms).unwrap_or_else(unix_ms);
+        let fresh = self.slow_fresh(now_ms);
+        let mut merged: Vec<TickRecord> = records
+            .iter()
+            .map(|r| TickRecord {
+                unix_ms: r.unix_ms,
+                elapsed_ns: r.elapsed_ns,
+                values: r.values.clone(),
+            })
+            .collect();
+        if fresh && let Some(last) = merged.last_mut() {
+            last.values.extend_from_slice(&self.slow_values);
+        }
+        let refs: Vec<&TickRecord> = merged.iter().collect();
+        score::assemble(&self.combined_layout, &refs, &self.engine.unavailable, &self.sysinfo)
     }
 
     /// Params for the per-tick "tick" notification, from the latest record.
@@ -135,7 +198,7 @@ impl State {
     /// failures, no sampling required.
     pub fn sources_now(&self) -> BTreeMap<String, SourceStatus> {
         let mut out = self.engine.unavailable.clone();
-        for f in &self.layout {
+        for f in &self.combined_layout {
             out.entry(f.collector.to_string()).or_insert_with(SourceStatus::ok);
         }
         out

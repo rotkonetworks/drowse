@@ -171,7 +171,7 @@ pub fn router(st: Arc<Mutex<State>>) -> Router {
     let s = st.clone();
     let score_get = handler(move |q: RpcRequest| {
         let window_s = p_f64(&q.params, "window_s").unwrap_or(DEFAULT_WINDOW_S);
-        if !(window_s > 0.0) {
+        if window_s.is_nan() || window_s <= 0.0 {
             return usage(q.id, "window_s must be > 0");
         }
         let mut st = s.lock().unwrap();

@@ -19,6 +19,18 @@ pub enum Kind {
     Gauge,
 }
 
+/// Latency class of a collector's `sample()` call. Governs which thread reads
+/// it: `Fast` collectors run on the ppoll sampler every tick; `Slow` ones run
+/// on the daemon's slow lane so their stall never blocks the fast tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Latency {
+    /// Cheap, memory-backed sysfs (cpuidle, amdgpu busy%, RAPL energy_uj).
+    Fast,
+    /// High-latency or hardware-waking (EC battery gauges, SMU mailbox): the
+    /// read stalls the calling thread and must run on the slow lane.
+    Slow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     Micros,
@@ -52,6 +64,12 @@ pub trait Collector: Send {
     /// deltas read 0).
     fn cadence(&self) -> u32 {
         1
+    }
+    /// Latency class. `Slow` collectors are moved to the daemon's slow lane so
+    /// their stalling `sample()` never blocks the fast sampler thread — the
+    /// real battery-safety property. Defaults to `Fast`.
+    fn latency(&self) -> Latency {
+        Latency::Fast
     }
 }
 
@@ -120,7 +138,7 @@ impl Engine {
             let start = self.offsets[i];
             let end = start + c.fields().len();
             let cadence = u64::from(c.cadence().max(1));
-            if self.ticks % cadence == 0 {
+            if self.ticks.is_multiple_of(cadence) {
                 c.sample(&mut self.curr[start..end])?;
             } else {
                 self.curr[start..end].copy_from_slice(&self.prev[start..end]);

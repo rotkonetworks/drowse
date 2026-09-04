@@ -1,7 +1,7 @@
 //! Unit tests: handlers driven through the real router against a fake
 //! engine, plus the timer arm/disarm policy. No sockets, no clocks.
 
-use crate::score::SysInfo;
+use crate::score::{FieldInfo, SysInfo};
 use crate::state::State;
 use crate::{rpc, timer_plan};
 use drowse_api::{RpcRequest, RpcResponse, Scorecard};
@@ -82,8 +82,10 @@ fn fake_engine() -> Engine {
 }
 
 fn test_state() -> Arc<Mutex<State>> {
+    // Battery lives in the fast fake engine here; the slow lane is exercised
+    // separately in the slow_lane_* tests. Empty slow layout => no merge.
     let sysinfo = SysInfo { hostname: "testhost".into(), kernel: "6.0-test".into() };
-    Arc::new(Mutex::new(State::new(fake_engine(), sysinfo)))
+    Arc::new(Mutex::new(State::new(fake_engine(), Vec::new(), 10_000, sysinfo)))
 }
 
 fn req(method: &str, params: Value) -> RpcRequest {
@@ -262,4 +264,88 @@ fn subscribe_requires_connection_and_registers() {
 
     let bad = drive(&mut svc, req("subscribe", json!({"kinds": ["offenders"]})));
     assert!(bad.error.is_some(), "unknown kind rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Slow lane: battery merges from the off-thread publish, and a frozen lane
+// degrades rather than reporting stale values as current.
+// ---------------------------------------------------------------------------
+
+fn cpuidle_only_engine() -> Engine {
+    let cpuidle = Fake {
+        name: "cpuidle",
+        fields: vec![
+            f("cpu0.POLL.time_us", Kind::Counter, Unit::Micros),
+            f("cpu0.C3.time_us", Kind::Counter, Unit::Micros),
+        ],
+        script: vec![vec![0, 100_000], vec![10_000, 2_000_000]],
+        i: 0,
+    };
+    Engine::new(vec![Probe::Ready(Box::new(cpuidle))])
+}
+
+fn battery_slow_layout() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo {
+            collector: "battery",
+            name: "BAT.power_now_uw".into(),
+            kind: Kind::Gauge,
+            unit: Unit::MicroWatts,
+        },
+        FieldInfo {
+            collector: "battery",
+            name: "BAT.discharging".into(),
+            kind: Kind::Gauge,
+            unit: Unit::Bool,
+        },
+    ]
+}
+
+fn slow_state(cadence_ms: u64) -> State {
+    let sysinfo = SysInfo { hostname: "testhost".into(), kernel: "6.0-test".into() };
+    State::new(cpuidle_only_engine(), battery_slow_layout(), cadence_ms, sysinfo)
+}
+
+#[test]
+fn slow_lane_values_merge_into_scorecard() {
+    let mut st = slow_state(1000);
+    st.tick_now(1_000_000_000, 100).unwrap();
+    st.tick_now(3_000_000_000, 200).unwrap(); // last record unix_ms = 200
+    // Published just now (age 0) -> fresh.
+    st.publish_slow(vec![Some(5_000_000), Some(1)], 200);
+
+    let recs = st.window_records(10.0);
+    let sc = st.make_scorecard(&recs);
+    let b = sc.battery.expect("battery present when slow lane is fresh");
+    assert!((b.power_w - 5.0).abs() < 1e-9);
+    assert!(b.discharging);
+    assert_eq!(sc.score.idle_draw_w, Some(5.0));
+    assert_eq!(sc.sources["battery"].state, drowse_api::SourceState::Ok);
+    // cpuidle came from the fast lane in the same card.
+    assert!(sc.score.sleep_efficiency.is_some());
+}
+
+#[test]
+fn slow_lane_staleness_degrades_battery() {
+    let mut st = slow_state(1000); // staleness threshold = 3000 ms
+    st.tick_now(1_000_000_000, 100).unwrap();
+    st.tick_now(3_000_000_000, 100_000).unwrap(); // now_ms = 100000
+    st.publish_slow(vec![Some(5_000_000), Some(1)], 100); // age ~100s >> 3s
+
+    let recs = st.window_records(10.0);
+    let sc = st.make_scorecard(&recs);
+    // A frozen slow lane must not present stale values as current...
+    assert!(sc.battery.is_none(), "stale slow lane withholds battery value");
+    // ...but battery stays visible as Degraded so the freeze is detectable.
+    assert_eq!(sc.sources["battery"].state, drowse_api::SourceState::Degraded);
+}
+
+#[test]
+fn slow_fresh_window_boundaries() {
+    let mut st = slow_state(1000); // threshold 3x = 3000 ms
+    assert!(!st.slow_fresh(0), "never-published slow lane is not fresh");
+    st.publish_slow(vec![Some(1), Some(0)], 1000);
+    assert!(st.slow_fresh(1000)); // age 0
+    assert!(st.slow_fresh(4000)); // age 3000 == threshold
+    assert!(!st.slow_fresh(4001)); // age 3001 > threshold
 }

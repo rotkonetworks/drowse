@@ -14,7 +14,7 @@
 //! reported and `valid` drops to 0.
 
 use crate::util;
-use drowse_core::{Collector, Field, Kind, Probe, Unit};
+use drowse_core::{Collector, Field, Kind, Latency, Probe, Unit};
 use rustix::fd::OwnedFd;
 use std::io;
 use std::path::Path;
@@ -129,9 +129,10 @@ impl Collector for Battery {
     /// Battery attributes are EC/ACPI-backed: one `power_now` pread costs
     /// ~4.5 ms and wakes the embedded controller (measured on the reference
     /// machine — it blew the daemon's wakeup budget when read every tick).
-    /// Battery truth moves on a seconds scale; every 5th tick is plenty.
-    fn cadence(&self) -> u32 {
-        5
+    /// `Slow` moves it to the daemon's slow lane, off the fast sampler thread,
+    /// which governs its cadence — so no `cadence()` override is needed here.
+    fn latency(&self) -> Latency {
+        Latency::Slow
     }
 
     /// Infallible by design: degradation is data (`valid` = 0), not an error.
