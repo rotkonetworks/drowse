@@ -2,8 +2,8 @@
 //! stack. Handlers only transform state; arming/disarming the timer is the
 //! transport loop's job (it re-reads `min_interval_ms` after every dispatch).
 
-use crate::state::{Policy, State};
-use drowse_api::{ErrorCode, ErrorData, RpcRequest, RpcResponse, SourceState, SourceStatus, SCHEMA};
+use crate::state::{Policy, PolicyHandle, State};
+use drowse_api::{ErrorCode, ErrorData, PowerStatus, RpcRequest, RpcResponse, SourceState, SourceStatus, SCHEMA};
 use drowse_core::service::{drive, handler, Layer, Router, RpcFuture, Service};
 use drowse_core::PowerState;
 use serde_json::{json, Value};
@@ -174,7 +174,7 @@ fn detect_power_state(explicit_on_battery: Option<bool>, st: &Arc<Mutex<State>>)
 /// Bare verb router (no logging) — used directly by tests. The policy engine
 /// rides its OWN `Arc<Mutex<Policy>>`, separate from the sampler `State`, so a
 /// slow `apply()` never holds the sampler lock.
-pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
+pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) -> Router {
     let s = st.clone();
     let system_check = handler(move |q: RpcRequest| {
         let st = s.lock().unwrap();
@@ -298,7 +298,7 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
     let p = policy.clone();
     let policy_plan = handler(move |q: RpcRequest| {
         let state = detect_power_state(p_bool(&q.params, "on_battery"), &s);
-        match &*p.lock().unwrap() {
+        match &p.lock().unwrap().engine {
             Policy::Unavailable(status) => policy_unavailable(q.id, status),
             Policy::Ready(engine) => match engine.plan(state) {
                 Ok(plan) => RpcResponse::ok(q.id, serde_json::to_value(plan).unwrap()),
@@ -313,10 +313,17 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
         // dry_run DEFAULTS TO TRUE: a missing flag must never mutate the host.
         let dry_run = p_bool(&q.params, "dry_run").unwrap_or(true);
         let state = detect_power_state(p_bool(&q.params, "on_battery"), &s);
-        match &mut *p.lock().unwrap() {
+        let mut g = p.lock().unwrap();
+        match &mut g.engine {
             Policy::Unavailable(status) => policy_unavailable(q.id, status),
             Policy::Ready(engine) => match engine.apply(state, dry_run) {
-                Ok(res) => RpcResponse::ok(q.id, serde_json::to_value(res).unwrap()),
+                Ok(res) => {
+                    // A real battery apply is now the active power-save plan.
+                    if !res.dry_run && state == PowerState::Battery {
+                        g.active_txn = Some(res.txn_id.clone());
+                    }
+                    RpcResponse::ok(q.id, serde_json::to_value(res).unwrap())
+                }
                 Err(e) => internal(q.id, format!("policy.apply failed: {e}")),
             },
         }
@@ -327,12 +334,62 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
         let Some(txn_id) = p_str(&q.params, "txn_id") else {
             return usage(q.id, "txn_id is required");
         };
-        match &mut *p.lock().unwrap() {
+        let mut g = p.lock().unwrap();
+        match &mut g.engine {
             Policy::Unavailable(status) => policy_unavailable(q.id, status),
             Policy::Ready(engine) => match engine.revert(&txn_id) {
-                Ok(res) => RpcResponse::ok(q.id, serde_json::to_value(res).unwrap()),
+                Ok(res) => {
+                    if g.active_txn.as_deref() == Some(txn_id.as_str()) {
+                        g.active_txn = None;
+                    }
+                    RpcResponse::ok(q.id, serde_json::to_value(res).unwrap())
+                }
                 Err(e) => internal(q.id, format!("policy.revert failed: {e}")),
             },
+        }
+    });
+
+    // -- power.status: compact state a bar renders and a toggle acts on. -----
+    let s = st.clone();
+    let p = policy.clone();
+    let power_status = handler(move |q: RpcRequest| {
+        let status = build_power_status(&s, &p);
+        RpcResponse::ok(q.id, serde_json::to_value(status).unwrap())
+    });
+
+    // -- power.toggle: flip power-save. Applies the battery plan when off,
+    //    reverts the active txn when on. This is what a bar's BAT click runs. -
+    let s = st.clone();
+    let p = policy.clone();
+    let power_toggle = handler(move |q: RpcRequest| {
+        let active = p.lock().unwrap().active_txn.clone();
+        let mut g = p.lock().unwrap();
+        let engine = match &mut g.engine {
+            Policy::Unavailable(status) => return policy_unavailable(q.id, status),
+            Policy::Ready(engine) => engine,
+        };
+        let outcome = match active {
+            // Power-save is on → turn it off.
+            Some(txn) => match engine.revert(&txn) {
+                Ok(_) => {
+                    g.active_txn = None;
+                    Ok(false)
+                }
+                Err(e) => Err(format!("toggle off (revert) failed: {e}")),
+            },
+            // Power-save is off → turn it on with the battery plan.
+            None => match engine.apply(PowerState::Battery, false) {
+                Ok(res) => {
+                    g.active_txn = Some(res.txn_id.clone());
+                    Ok(true)
+                }
+                Err(e) => Err(format!("toggle on (apply) failed: {e}")),
+            },
+        };
+        drop(g);
+        match outcome {
+            Ok(_) => RpcResponse::ok(q.id, serde_json::to_value(build_power_status(&s, &p)).unwrap()),
+            Err(e) => internal(q.id, e),
         }
     });
 
@@ -346,20 +403,40 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
         .route("policy.plan", policy_plan)
         .route("policy.apply", policy_apply)
         .route("policy.revert", policy_revert)
+        .route("power.status", power_status)
+        .route("power.toggle", power_toggle)
         .route("subscribe", subscribe)
 }
 
+/// Assemble a [`PowerStatus`] from the sampler state and the policy handle.
+fn build_power_status(st: &Arc<Mutex<State>>, policy: &Arc<Mutex<PolicyHandle>>) -> PowerStatus {
+    let on_battery = detect_power_state(None, st) == PowerState::Battery;
+    let active_txn_id = policy.lock().unwrap().active_txn.clone();
+    let (sleep_efficiency, grade) = {
+        let s = st.lock().unwrap();
+        s.latest_sleep_efficiency()
+    };
+    PowerStatus {
+        schema: SCHEMA,
+        kind: "power_status".into(),
+        on_battery,
+        power_save_active: active_txn_id.is_some(),
+        active_txn_id,
+        sleep_efficiency,
+        grade,
+    }
+}
+
 /// The full production stack: router wrapped in the logging filter.
-pub fn service(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Log<Router> {
+pub fn service(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) -> Log<Router> {
     LogLayer.layer(router(st, policy))
 }
 
 /// Build an `Unavailable` policy handle. Test-only: production builds the
 /// handle from `drowse_policy::probe()`, which is always Ready.
 #[cfg(test)]
-pub fn unavailable_policy(detail: &str) -> Arc<Mutex<Policy>> {
-    Arc::new(Mutex::new(Policy::Unavailable(SourceStatus::err(
-        SourceState::NotPresent,
-        detail,
+pub fn unavailable_policy(detail: &str) -> Arc<Mutex<PolicyHandle>> {
+    Arc::new(Mutex::new(PolicyHandle::new(Policy::Unavailable(
+        SourceStatus::err(SourceState::NotPresent, detail),
     ))))
 }

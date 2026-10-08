@@ -15,8 +15,8 @@
 mod mcp;
 
 use drowse_api::{
-    ApplyResult, ErrorCode, Grade, Offenders, Plan, PolicyAction, RevertResult, Risk, RpcRequest,
-    RpcResponse, Scorecard, SourceState, Tier,
+    ApplyResult, ErrorCode, Grade, Offenders, Plan, PolicyAction, PowerStatus, RevertResult, Risk,
+    RpcRequest, RpcResponse, Scorecard, SourceState, Tier,
 };
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
@@ -42,6 +42,8 @@ COMMANDS:
   fix [--apply] [--on-ac]    preview the fixes (dry-run); --apply enacts them
                              and prints a txn id to revert with
   revert <txn-id>            undo a previously applied fix transaction
+  status [--polybar]         show power-save state (--polybar: one colored BAT label)
+  toggle                     flip power-save on/off (what a BAT click runs)
   mcp-serve                  speak MCP over stdio so an AI agent can drive drowse
 
 OUTPUT: human text on a tty, JSON otherwise; --json / --table force either.
@@ -75,6 +77,8 @@ enum Cmd {
     Plan { on_ac: bool },
     Fix { apply: bool, on_ac: bool },
     Revert { txn_id: String },
+    Status { polybar: bool },
+    Toggle,
     /// Stdio MCP server: translates MCP tool calls into drowsed verb calls.
     McpServe,
 }
@@ -135,6 +139,8 @@ fn run() -> i32 {
         Cmd::Plan { on_ac } => cmd_plan(stream, on_ac, cli.output),
         Cmd::Fix { apply, on_ac } => cmd_fix(stream, apply, on_ac, cli.output),
         Cmd::Revert { txn_id } => cmd_revert(stream, &txn_id, cli.output),
+        Cmd::Status { polybar } => cmd_status(stream, polybar, cli.output),
+        Cmd::Toggle => cmd_toggle(stream, cli.output),
         // Handled above with an early return, before the up-front connect.
         Cmd::McpServe => unreachable!("mcp-serve dispatched before connect"),
     };
@@ -158,6 +164,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
     let mut ac = false;
     let mut on_ac = false;
     let mut apply = false;
+    let mut polybar = false;
 
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -201,6 +208,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
             "--ac" => ac = true,
             "--on-ac" => on_ac = true,
             "--apply" => apply = true,
+            "--polybar" => polybar = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -270,9 +278,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
             let txn_id = arg1.ok_or_else(|| Fail::usage("revert needs a transaction id: drowse revert <txn-id>"))?;
             Cmd::Revert { txn_id }
         }
-        Some("mcp-serve") => {
+        Some("status") => {
             deny(
                 gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply || has_arg1,
+                "`status` takes only --polybar",
+            )?;
+            Cmd::Status { polybar }
+        }
+        Some("toggle") => {
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply || polybar || has_arg1,
+                "`toggle` takes no flags",
+            )?;
+            Cmd::Toggle
+        }
+        Some("mcp-serve") => {
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply || polybar || has_arg1,
                 "`mcp-serve` takes no flags",
             )?;
             Cmd::McpServe
@@ -562,6 +584,85 @@ fn cmd_revert(stream: UnixStream, txn_id: &str, output: Output) -> Result<i32, F
         },
     }
     Ok(0)
+}
+
+// Polybar foreground colors by power-save mode (gruvbox-ish, theme-neutral).
+const COLOR_SAVING: &str = "#b8bb26"; // power-save active — green
+const COLOR_BATTERY: &str = "#fabd2f"; // on battery, not saving — yellow
+const COLOR_AC: &str = "#83a598"; // on AC, not saving — blue
+
+fn cmd_status(stream: UnixStream, polybar: bool, output: Output) -> Result<i32, Fail> {
+    let result = call_once(stream, "power.status", None)?;
+    // --polybar always wins over JSON: polybar runs us non-interactively.
+    if polybar {
+        match serde_json::from_value::<PowerStatus>(result) {
+            Ok(st) => print!("{}", render_polybar(&st)),
+            // Daemon down / bad shape: a dim placeholder, never a crash in the bar.
+            Err(_) => println!("%{{F{COLOR_BATTERY}}}BAT ?%{{F-}}"),
+        }
+        return Ok(0);
+    }
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<PowerStatus>(result.clone()) {
+            Ok(st) => print!("{}", render_status(&st)),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
+fn cmd_toggle(stream: UnixStream, output: Output) -> Result<i32, Fail> {
+    let result = call_once(stream, "power.toggle", None)?;
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<PowerStatus>(result.clone()) {
+            Ok(st) => println!(
+                "power-save {}",
+                if st.power_save_active { "ON" } else { "OFF" }
+            ),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
+/// One colored BAT label for a polybar custom/script module. Color reflects
+/// mode; a `*` marks power-save active. Pair with `click-left = drowse toggle`.
+fn render_polybar(st: &PowerStatus) -> String {
+    let color = if st.power_save_active {
+        COLOR_SAVING
+    } else if st.on_battery {
+        COLOR_BATTERY
+    } else {
+        COLOR_AC
+    };
+    let mark = if st.power_save_active { "*" } else { "" };
+    let grade = st
+        .grade
+        .map(|g| format!(" {g:?}"))
+        .unwrap_or_default();
+    format!("%{{F{color}}}BAT{mark}{grade}%{{F-}}\n")
+}
+
+/// Human one-liner for `drowse status`.
+fn render_status(st: &PowerStatus) -> String {
+    let power = if st.on_battery { "on battery" } else { "on AC" };
+    let save = if st.power_save_active {
+        "power-save ON"
+    } else {
+        "power-save off"
+    };
+    let se = match (st.sleep_efficiency, st.grade) {
+        (Some(se), Some(g)) => format!(" · SE {se:.0}/100 ({g:?})"),
+        _ => String::new(),
+    };
+    let txn = st
+        .active_txn_id
+        .as_deref()
+        .map(|t| format!(" · txn {t}"))
+        .unwrap_or_default();
+    format!("{power} · {save}{se}{txn}\n")
 }
 
 fn tier_str(t: Tier) -> &'static str {

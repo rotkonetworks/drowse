@@ -21,7 +21,7 @@ use rustix::time::{
     TimerfdTimerFlags, Timespec,
 };
 use drowse_core::{Attributor, Collector, Engine, Probe};
-use state::{boottime_ns, unix_ms, Policy, State};
+use state::{boottime_ns, unix_ms, Policy, PolicyHandle, State};
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -218,13 +218,13 @@ fn run(
     // Policy (M3): the act layer. Always Ready — plan works unprivileged and
     // apply reports per-action PermissionDenied. Held behind its OWN mutex so a
     // slow apply() never blocks the sampler lock.
-    let policy = Arc::new(Mutex::new(match drowse_policy::probe() {
+    let policy = Arc::new(Mutex::new(PolicyHandle::new(match drowse_policy::probe() {
         drowse_core::PolicyProbe::Ready(engine) => Policy::Ready(engine),
         drowse_core::PolicyProbe::Unavailable(status) => {
             eprintln!("drowsed: policy {:?}", status.state);
             Policy::Unavailable(status)
         }
-    }));
+    })));
 
     let st = Arc::new(Mutex::new(State::new(
         fast_engine,

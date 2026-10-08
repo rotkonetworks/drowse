@@ -2,7 +2,7 @@
 //! engine, plus the timer arm/disarm policy. No sockets, no clocks.
 
 use crate::score::{FieldInfo, SysInfo};
-use crate::state::{Policy, State};
+use crate::state::{Policy, PolicyHandle, State};
 use crate::{rpc, timer_plan};
 use drowse_api::{
     ApplyResult, ErrorCode, OffenderKind, Plan, PolicyAction, RevertResult, Risk, RpcRequest,
@@ -543,7 +543,7 @@ impl PolicyEngine for FakePolicy {
 }
 
 fn policy_router() -> Router {
-    let pol = Arc::new(Mutex::new(Policy::Ready(Box::new(FakePolicy))));
+    let pol = Arc::new(Mutex::new(PolicyHandle::new(Policy::Ready(Box::new(FakePolicy)))));
     rpc::router(test_state(), pol)
 }
 

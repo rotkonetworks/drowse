@@ -65,6 +65,22 @@ pub enum Policy {
     Unavailable(SourceStatus),
 }
 
+/// The policy engine plus the daemon's memory of the battery plan currently in
+/// effect. `active_txn` is set when a real (non-dry) battery apply succeeds —
+/// by a manual `power.toggle`/`policy.apply`, or by the `--auto-apply` watcher
+/// — and cleared on revert, so `power.status` can report whether power-save is
+/// on and `power.toggle` knows which way to flip.
+pub struct PolicyHandle {
+    pub engine: Policy,
+    pub active_txn: Option<String>,
+}
+
+impl PolicyHandle {
+    pub fn new(engine: Policy) -> Self {
+        PolicyHandle { engine, active_txn: None }
+    }
+}
+
 /// One drained attribution window: per-offender counts and the wall time they
 /// accumulated over. `offenders.get` divides counts by the window for rates,
 /// so it never blocks on the attributor — it reads this last snapshot.
@@ -274,6 +290,17 @@ impl State {
             }
         }
         None
+    }
+
+    /// Latest Sleep Efficiency + grade from recent history, for `power.status`.
+    /// None until two ticks exist.
+    pub fn latest_sleep_efficiency(&self) -> (Option<f64>, Option<drowse_api::Grade>) {
+        if self.history.len() < 2 {
+            return (None, None);
+        }
+        let records: Vec<&TickRecord> = self.history.iter().collect();
+        let card = self.make_scorecard(&records);
+        (card.score.sleep_efficiency, card.score.grade)
     }
 }
 
