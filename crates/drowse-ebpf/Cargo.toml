@@ -8,4 +8,10 @@ description = "eBPF wakeup attribution: in-kernel blame counting, drained on a s
 [dependencies]
 drowse-api.workspace = true
 drowse-core.workspace = true
-# libbpf-rs / libbpf-cargo added by the attribution implementation.
+# Runtime loader. Pinned exact; 0.27.1 published 2026-09-03 (>2 weeks old).
+libbpf-rs = "=0.27.1"
+libc = "=0.2.189"
+
+[build-dependencies]
+# Compiles the CO-RE BPF object and generates the skeleton at build time.
+libbpf-cargo = "=0.27.1"

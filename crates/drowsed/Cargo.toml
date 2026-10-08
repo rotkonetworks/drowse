@@ -9,5 +9,6 @@ description = "The drowse daemon: sampler + JSON-RPC control socket."
 drowse-api.workspace = true
 drowse-core.workspace = true
 drowse-collectors.workspace = true
+drowse-ebpf.workspace = true
 serde_json.workspace = true
 rustix.workspace = true
