@@ -12,6 +12,8 @@
 //! 10 permission, 11 not-present, 12 daemon unreachable, 14 session unknown,
 //! 15 busy, 16 kernel, 1 internal); 20 when --gate is not met.
 
+mod mcp;
+
 use drowse_api::{
     ErrorCode, Grade, Offenders, RpcRequest, RpcResponse, Scorecard, SourceState,
 };
@@ -34,6 +36,7 @@ COMMANDS:
   watch                      stream one score line per tick until Ctrl-C
   offenders [--window N]     who wakes the CPU, ranked by battery cost
             [--top K]        (needs the root daemon for eBPF attribution)
+  mcp-serve                  speak MCP over stdio so an AI agent can drive drowse
 
 OUTPUT: human text on a tty, JSON otherwise; --json / --table force either.
 ";
@@ -63,6 +66,8 @@ enum Cmd {
     Score { window_s: Option<f64> },
     Watch,
     Offenders { window_s: Option<f64>, top: Option<usize> },
+    /// Stdio MCP server: translates MCP tool calls into drowsed verb calls.
+    McpServe,
 }
 
 struct Fail {
@@ -88,6 +93,18 @@ fn run() -> i32 {
             return f.exit;
         }
     };
+    // `mcp-serve` does not open a connection up front: it is a long-lived stdio
+    // server that opens a short-lived socket per tool call, so the daemon may
+    // start (or auto-spawn) after the server is already running.
+    if let Cmd::McpServe = cli.cmd {
+        return match mcp::serve(cli.socket) {
+            Ok(code) => code,
+            Err(f) => {
+                eprintln!("drowse: {}", f.msg);
+                f.exit
+            }
+        };
+    }
     let stream = match connect(cli.socket.as_deref()) {
         Ok(s) => s,
         Err(f) => {
@@ -106,6 +123,8 @@ fn run() -> i32 {
         }
         Cmd::Watch => cmd_watch(stream, cli.output),
         Cmd::Offenders { window_s, top } => cmd_offenders(stream, window_s, top, cli.output),
+        // Handled above with an early return, before the up-front connect.
+        Cmd::McpServe => unreachable!("mcp-serve dispatched before connect"),
     };
     match r {
         Ok(code) => code,
@@ -199,6 +218,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
                 return Err(Fail::usage("--gate only applies to `check`"));
             }
             Cmd::Offenders { window_s, top }
+        }
+        Some("mcp-serve") => {
+            if gate.is_some() || window_s.is_some() || top.is_some() {
+                return Err(Fail::usage("`mcp-serve` takes no --gate/--window/--top"));
+            }
+            Cmd::McpServe
         }
         Some(other) => return Err(Fail::usage(format!("unknown command {other:?}"))),
         None => return Err(Fail::usage("missing command")),
