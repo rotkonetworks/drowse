@@ -97,6 +97,7 @@ pub struct EbpfAttributor {
     irq_names: HashMap<u64, String>,
     /// Observer bucket is a cumulative counter; keep the last sum for deltas.
     prev_observer: u64,
+    prev_all_idle: u64,
     ncpus: usize,
 }
 
@@ -126,6 +127,7 @@ impl EbpfAttributor {
             ksyms: KallsymsIndex::load(),
             irq_names: HashMap::new(),
             prev_observer: 0,
+            prev_all_idle: 0,
             ncpus,
         })
     }
@@ -257,9 +259,22 @@ impl Attributor for EbpfAttributor {
         self.prev_observer = observer_total;
 
         let _ = self.ncpus; // kept for future rate/window math
-        // all-cores-idle residency (gap #1, honest SE) — 0 until the BPF side
-        // tracks it; the daemon falls back to os-timed-mean while this is 0.
-        let all_cores_idle_ns = 0u64;
+
+        // All-cores-idle residency (gap #1, honest SE): cumulative counter in
+        // idle_resident[0].ns; delta against the last drain like the observer.
+        let all_idle_total = {
+            let key = 0u32.to_ne_bytes();
+            match self.skel.maps.idle_resident.lookup(&key, MapFlags::ANY).map_err(to_io)? {
+                // value layout: { u64 ns; u64 start; } — we want ns (first 8 bytes).
+                Some(bytes) if bytes.len() >= 8 => {
+                    u64::from_ne_bytes(bytes[..8].try_into().unwrap())
+                }
+                _ => 0,
+            }
+        };
+        let all_cores_idle_ns = all_idle_total.saturating_sub(self.prev_all_idle);
+        self.prev_all_idle = all_idle_total;
+
         Ok(AttributionDelta { offenders, observer_wakeups, all_cores_idle_ns })
     }
 }

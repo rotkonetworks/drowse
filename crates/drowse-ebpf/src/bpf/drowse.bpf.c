@@ -99,6 +99,20 @@ struct {
     __type(value, __u64);
 } observer SEC(".maps");
 
+// Honest-SE residency: cumulative time ALL cpus were simultaneously idle.
+// [0].ns is the running total; [0].start marks when the current all-idle
+// window began (0 when not all-idle). Userspace deltas .ns between drains.
+struct idle_stats {
+    __u64 ns;
+    __u64 start;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct idle_stats);
+} idle_resident SEC(".maps");
+
 static __always_inline void push_ctx(__u32 kind, __u64 id)
 {
     __u32 z = 0;
@@ -205,19 +219,33 @@ int BPF_PROG(on_cpu_idle, unsigned int state, unsigned int cpu_id)
     if (!f)
         return 0;
 
+    struct idle_stats *rs = bpf_map_lookup_elem(&idle_resident, &z);
+
     if (state == PWR_EVENT_EXIT) {
         if (*f) {
             *f = 0;
             __u64 *ic = bpf_map_lookup_elem(&idle_count, &z);
-            if (ic && *ic > 0)
-                __sync_fetch_and_add(ic, -(__u64)1);
+            if (ic && *ic > 0) {
+                __u64 old = __sync_fetch_and_add(ic, -(__u64)1);
+                // Leaving all-idle: close the window and bank its duration.
+                if (rs && old >= nr_cpus && rs->start) {
+                    __u64 now = bpf_ktime_get_ns();
+                    if (now > rs->start)
+                        rs->ns += now - rs->start;
+                    rs->start = 0;
+                }
+            }
         }
     } else {
         if (!*f) {
             *f = 1;
             __u64 *ic = bpf_map_lookup_elem(&idle_count, &z);
-            if (ic)
-                __sync_fetch_and_add(ic, 1);
+            if (ic) {
+                __u64 old = __sync_fetch_and_add(ic, 1);
+                // Entering all-idle (this is the last cpu to go idle): start it.
+                if (rs && old + 1 >= nr_cpus && !rs->start)
+                    rs->start = bpf_ktime_get_ns();
+            }
         }
     }
     return 0;
