@@ -4,7 +4,7 @@
 
 use crate::score::{self, FieldInfo, SysInfo, TickRecord};
 use drowse_api::{Offenders, Scorecard, SourceStatus};
-use drowse_core::{AttributionDelta, Engine, RawOffender};
+use drowse_core::{AttributionDelta, Engine, PolicyEngine, RawOffender, Unit};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,6 +53,16 @@ pub struct State {
     pub attr_source: SourceStatus,
     /// Last published attribution window; None until the first drain lands.
     pub attr: Option<AttrWindow>,
+}
+
+/// The policy engine, held behind its OWN mutex — separate from the sampler
+/// `State` — so a slow `apply()` (verify-after-apply reads knobs back, watches
+/// AER) never holds the sampler lock and never blocks sampling. `probe()`
+/// returns Ready even unprivileged (apply reports per-action PermissionDenied),
+/// so `Unavailable` is only a safety net.
+pub enum Policy {
+    Ready(Box<dyn PolicyEngine>),
+    Unavailable(SourceStatus),
 }
 
 /// One drained attribution window: per-offender counts and the wall time they
@@ -252,6 +262,18 @@ impl State {
             out.entry(f.collector.to_string()).or_insert_with(SourceStatus::ok);
         }
         out
+    }
+
+    /// Last known battery discharge state from the slow lane's published gauge,
+    /// used only as the fallback for power-state detection when AC `online` is
+    /// unreadable. `None` when battery telemetry is absent or not yet sampled.
+    pub fn battery_discharging(&self) -> Option<bool> {
+        for (i, f) in self.slow_layout.iter().enumerate() {
+            if f.collector == "battery" && f.unit == Unit::Bool && f.name.contains("discharg") {
+                return self.slow_values.get(i).copied().flatten().map(|v| v != 0);
+            }
+        }
+        None
     }
 }
 

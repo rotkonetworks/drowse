@@ -18,15 +18,11 @@
 //! build). On `initialize` we echo the client's requested `protocolVersion`
 //! when it sends one, so we interoperate across revisions for our tiny surface.
 //!
-//! TODO(M3 policy.* verbs): once the daemon grows the policy engine, add three
-//! more tools here, each a one-verb translation like the read tools below:
-//!   - `plan_fixes`  -> policy.plan   {window_s?} : propose reversible fixes
-//!                      with expected battery impact + confidence, no changes.
-//!   - `apply_fix`   -> policy.apply  {action_id, dry_run?} : enact one planned
-//!                      fix by its stable id; return the measured-after delta.
-//!   - `revert_fix`  -> policy.revert {action_id} : undo a previously applied
-//!                      fix. Keep these read-vs-mutate honest in the tool
-//!                      descriptions so an agent knows apply/revert change state.
+//! Policy tools (M3) mirror the daemon's policy verbs, with mutation stated
+//! honestly in each description so an agent knows what changes the machine:
+//!   - `plan_fixes` -> policy.plan {on_battery?}: read-only preview.
+//!   - `apply_fix` -> policy.apply {dry_run?, on_battery?}: dry-run by default (read-only); mutates ONLY with dry_run:false.
+//!   - `revert_fix` -> policy.revert {txn_id}: mutates (undo).
 
 use crate::{Fail, call_once, connect};
 use drowse_api::ErrorCode;
@@ -173,6 +169,63 @@ Call this first to learn what the other tools can measure here. Read-only.",
                 "properties": {},
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "plan_fixes",
+            "description": "Propose reversible power-saving fixes for the current power state. \
+READ-ONLY: this changes nothing. It lists the actions (each with tier, risk, and \
+the knob's current->target value) that apply_fix could enact, plus actions \
+excluded by tier/quirk with the reason. Pass on_battery to force the battery \
+(true) or AC (false) plan instead of the live power state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "on_battery": {
+                        "type": "boolean",
+                        "description": "Force battery (true) or AC (false) plan. Omit to use the live power state."
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "apply_fix",
+            "description": "Apply the power-saving fixes — or preview them. DEFAULTS TO A DRY RUN: \
+with dry_run omitted or true it only reports what WOULD change and is READ-ONLY. \
+Pass dry_run:false to ACTUALLY CHANGE system power settings (sysfs/cgroup knobs); \
+that result includes a txn_id to undo later with revert_fix. This tool mutates \
+the machine only when dry_run is explicitly false.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "false actually applies and changes settings; omitted/true previews only (default)."
+                    },
+                    "on_battery": {
+                        "type": "boolean",
+                        "description": "Force battery (true) or AC (false) context. Omit to use the live power state."
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "revert_fix",
+            "description": "Undo a previously applied fix transaction by its txn_id (returned by a \
+non-dry-run apply_fix). MUTATES the machine: it restores the changed power \
+settings to the values they had before the fix.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "txn_id": {
+                        "type": "string",
+                        "description": "Transaction id from a prior apply_fix with dry_run:false."
+                    }
+                },
+                "required": ["txn_id"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -205,7 +258,31 @@ fn build_call(name: &str, args: &Value) -> Option<(&'static str, Option<Value>)>
         "sleep_efficiency" => Some(("score.get", number_params(args, &["window_s"]))),
         "wakeup_offenders" => Some(("offenders.get", number_params(args, &["window_s", "limit"]))),
         "check_sources" => Some(("system.check", None)),
+        // Policy tools forward boolean/string args (not just numbers).
+        "plan_fixes" => Some(("policy.plan", forward_params(args, &["on_battery"]))),
+        "apply_fix" => Some(("policy.apply", forward_params(args, &["dry_run", "on_battery"]))),
+        "revert_fix" => Some(("policy.revert", forward_params(args, &["txn_id"]))),
         _ => None,
+    }
+}
+
+/// Forward the named keys whose values are scalars (bool/number/string) into a
+/// params object, or `None` if none are present. The per-tool inputSchema has
+/// already rejected unknown keys and wrong types client-side; this is the
+/// server-side safety net. Note: a missing `dry_run` is intentionally NOT
+/// defaulted here — the daemon's `policy.apply` defaults it to true (dry run),
+/// so omitting it stays safe.
+fn forward_params(args: &Value, keys: &[&str]) -> Option<Value> {
+    let mut obj = serde_json::Map::new();
+    for &k in keys {
+        if let Some(v) = args.get(k).filter(|v| v.is_boolean() || v.is_number() || v.is_string()) {
+            obj.insert(k.to_string(), v.clone());
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
     }
 }
 
@@ -280,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_the_three_read_tools() {
+    fn tools_list_exposes_read_and_policy_tools() {
         let tools = tool_list();
         let names: Vec<&str> = tools
             .as_array()
@@ -288,7 +365,17 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["sleep_efficiency", "wakeup_offenders", "check_sources"]);
+        assert_eq!(
+            names,
+            [
+                "sleep_efficiency",
+                "wakeup_offenders",
+                "check_sources",
+                "plan_fixes",
+                "apply_fix",
+                "revert_fix"
+            ]
+        );
         // Every tool must carry a schema so an agent can form valid arguments.
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -297,11 +384,58 @@ mod tests {
     }
 
     #[test]
+    fn apply_fix_description_is_honest_about_mutation() {
+        let tools = tool_list();
+        let tool = |n: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        // plan_fixes and the default apply_fix must read as non-mutating; a
+        // real apply must be flagged as changing the system.
+        let plan = tool("plan_fixes");
+        assert!(plan["description"].as_str().unwrap().contains("READ-ONLY"));
+        let apply = tool("apply_fix");
+        let apply_desc = apply["description"].as_str().unwrap();
+        assert!(apply_desc.contains("DRY RUN"));
+        assert!(apply_desc.contains("CHANGE system power settings"));
+        let revert = tool("revert_fix");
+        assert!(revert["description"].as_str().unwrap().contains("MUTATES"));
+        // revert_fix requires a txn_id so an agent can't call it blindly.
+        assert_eq!(revert["inputSchema"]["required"][0], "txn_id");
+    }
+
+    #[test]
     fn build_call_maps_tools_to_verbs() {
         assert_eq!(build_call("check_sources", &json!({})).unwrap().0, "system.check");
         assert_eq!(build_call("sleep_efficiency", &json!({})).unwrap().0, "score.get");
         assert_eq!(build_call("wakeup_offenders", &json!({})).unwrap().0, "offenders.get");
-        assert!(build_call("apply_fix", &json!({})).is_none());
+        assert_eq!(build_call("plan_fixes", &json!({})).unwrap().0, "policy.plan");
+        assert_eq!(build_call("apply_fix", &json!({})).unwrap().0, "policy.apply");
+        assert_eq!(build_call("revert_fix", &json!({})).unwrap().0, "policy.revert");
+        assert!(build_call("no_such_tool", &json!({})).is_none());
+    }
+
+    #[test]
+    fn apply_fix_forwards_dry_run_bool_and_defaults_safe() {
+        // dry_run:false is forwarded so the agent can actually apply.
+        let (verb, p) = build_call("apply_fix", &json!({ "dry_run": false })).unwrap();
+        assert_eq!(verb, "policy.apply");
+        assert_eq!(p.unwrap(), json!({ "dry_run": false }));
+        // Omitted dry_run forwards nothing -> daemon defaults to dry-run.
+        let (_, p) = build_call("apply_fix", &json!({})).unwrap();
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn revert_fix_forwards_txn_id_string() {
+        let (verb, p) = build_call("revert_fix", &json!({ "txn_id": "txn-9" })).unwrap();
+        assert_eq!(verb, "policy.revert");
+        assert_eq!(p.unwrap(), json!({ "txn_id": "txn-9" }));
     }
 
     #[test]
@@ -326,7 +460,7 @@ mod tests {
         )
         .expect("request gets a response");
         assert_eq!(resp["id"], 2);
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
     }
 
     #[test]

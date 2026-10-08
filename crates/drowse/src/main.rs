@@ -15,7 +15,8 @@
 mod mcp;
 
 use drowse_api::{
-    ErrorCode, Grade, Offenders, RpcRequest, RpcResponse, Scorecard, SourceState,
+    ApplyResult, ErrorCode, Grade, Offenders, Plan, PolicyAction, RevertResult, Risk, RpcRequest,
+    RpcResponse, Scorecard, SourceState, Tier,
 };
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
@@ -36,6 +37,11 @@ COMMANDS:
   watch                      stream one score line per tick until Ctrl-C
   offenders [--window N]     who wakes the CPU, ranked by battery cost
             [--top K]        (needs the root daemon for eBPF attribution)
+  plan [--ac]                show the reversible power fixes for the current
+                             (or --ac) power state; changes nothing
+  fix [--apply] [--on-ac]    preview the fixes (dry-run); --apply enacts them
+                             and prints a txn id to revert with
+  revert <txn-id>            undo a previously applied fix transaction
   mcp-serve                  speak MCP over stdio so an AI agent can drive drowse
 
 OUTPUT: human text on a tty, JSON otherwise; --json / --table force either.
@@ -66,6 +72,9 @@ enum Cmd {
     Score { window_s: Option<f64> },
     Watch,
     Offenders { window_s: Option<f64>, top: Option<usize> },
+    Plan { on_ac: bool },
+    Fix { apply: bool, on_ac: bool },
+    Revert { txn_id: String },
     /// Stdio MCP server: translates MCP tool calls into drowsed verb calls.
     McpServe,
 }
@@ -123,6 +132,9 @@ fn run() -> i32 {
         }
         Cmd::Watch => cmd_watch(stream, cli.output),
         Cmd::Offenders { window_s, top } => cmd_offenders(stream, window_s, top, cli.output),
+        Cmd::Plan { on_ac } => cmd_plan(stream, on_ac, cli.output),
+        Cmd::Fix { apply, on_ac } => cmd_fix(stream, apply, on_ac, cli.output),
+        Cmd::Revert { txn_id } => cmd_revert(stream, &txn_id, cli.output),
         // Handled above with an early return, before the up-front connect.
         Cmd::McpServe => unreachable!("mcp-serve dispatched before connect"),
     };
@@ -139,9 +151,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
     let mut output: Option<Output> = None;
     let mut socket: Option<PathBuf> = None;
     let mut cmd: Option<String> = None;
+    let mut arg1: Option<String> = None;
     let mut gate: Option<Grade> = None;
     let mut window_s: Option<f64> = None;
     let mut top: Option<usize> = None;
+    let mut ac = false;
+    let mut on_ac = false;
+    let mut apply = false;
 
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -182,47 +198,83 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
                     .ok_or_else(|| Fail::usage(format!("--top takes a count > 0, not {v:?}")))?;
                 top = Some(k);
             }
+            "--ac" => ac = true,
+            "--on-ac" => on_ac = true,
+            "--apply" => apply = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
             f if f.starts_with('-') => return Err(Fail::usage(format!("unknown flag {f}"))),
             _ if cmd.is_none() => cmd = Some(arg),
+            _ if arg1.is_none() => arg1 = Some(arg),
             other => return Err(Fail::usage(format!("unexpected argument {other:?}"))),
         }
     }
 
-    // `--gate` is check-only; `--top` is offenders-only; `--window` serves
-    // score and offenders.
+    // Flag applicability is per-command: reject misplaced flags up front so an
+    // agent gets a clear usage error rather than a silently ignored argument.
+    let deny = |cond: bool, msg: &str| -> Result<(), Fail> {
+        if cond { Err(Fail::usage(msg.to_string())) } else { Ok(()) }
+    };
+    // Flags no command below accepts as a trailing positional, except `revert`.
+    let has_arg1 = arg1.is_some();
+
     let cmd = match cmd.as_deref() {
         Some("check") => {
-            if window_s.is_some() || top.is_some() {
-                return Err(Fail::usage("`check` takes no --window/--top"));
-            }
+            deny(window_s.is_some() || top.is_some(), "`check` takes no --window/--top")?;
+            deny(ac || on_ac || apply, "`check` takes no --ac/--on-ac/--apply")?;
+            deny(has_arg1, "`check` takes no positional argument")?;
             Cmd::Check { gate }
         }
         Some("score") => {
-            if gate.is_some() || top.is_some() {
-                return Err(Fail::usage("`score` takes no --gate/--top"));
-            }
+            deny(gate.is_some() || top.is_some(), "`score` takes no --gate/--top")?;
+            deny(ac || on_ac || apply, "`score` takes no --ac/--on-ac/--apply")?;
+            deny(has_arg1, "`score` takes no positional argument")?;
             Cmd::Score { window_s }
         }
         Some("watch") => {
-            if gate.is_some() || window_s.is_some() || top.is_some() {
-                return Err(Fail::usage("`watch` takes no --gate/--window/--top"));
-            }
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply || has_arg1,
+                "`watch` takes no flags",
+            )?;
             Cmd::Watch
         }
         Some("offenders") => {
-            if gate.is_some() {
-                return Err(Fail::usage("--gate only applies to `check`"));
-            }
+            deny(gate.is_some(), "--gate only applies to `check`")?;
+            deny(ac || on_ac || apply, "`offenders` takes no --ac/--on-ac/--apply")?;
+            deny(has_arg1, "`offenders` takes no positional argument")?;
             Cmd::Offenders { window_s, top }
         }
+        Some("plan") => {
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || on_ac || apply,
+                "`plan` takes only --ac",
+            )?;
+            deny(has_arg1, "`plan` takes no positional argument")?;
+            Cmd::Plan { on_ac: ac }
+        }
+        Some("fix") => {
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac,
+                "`fix` takes only --apply and --on-ac",
+            )?;
+            deny(has_arg1, "`fix` takes no positional argument")?;
+            Cmd::Fix { apply, on_ac }
+        }
+        Some("revert") => {
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply,
+                "`revert` takes only a transaction id",
+            )?;
+            let txn_id = arg1.ok_or_else(|| Fail::usage("revert needs a transaction id: drowse revert <txn-id>"))?;
+            Cmd::Revert { txn_id }
+        }
         Some("mcp-serve") => {
-            if gate.is_some() || window_s.is_some() || top.is_some() {
-                return Err(Fail::usage("`mcp-serve` takes no --gate/--window/--top"));
-            }
+            deny(
+                gate.is_some() || window_s.is_some() || top.is_some() || ac || on_ac || apply || has_arg1,
+                "`mcp-serve` takes no flags",
+            )?;
             Cmd::McpServe
         }
         Some(other) => return Err(Fail::usage(format!("unknown command {other:?}"))),
@@ -462,6 +514,147 @@ fn cmd_offenders(
         },
     }
     Ok(0)
+}
+
+/// `plan`: read-only. Shows what would change in the current (or --ac) power
+/// state. Omitting `on_battery` lets the daemon detect the live power state.
+fn cmd_plan(stream: UnixStream, on_ac: bool, output: Output) -> Result<i32, Fail> {
+    let params = on_ac.then(|| serde_json::json!({ "on_battery": false }));
+    let result = call_once(stream, "policy.plan", params)?;
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<Plan>(result.clone()) {
+            Ok(plan) => print!("{}", render_plan(&plan)),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
+/// `fix`: dry-run by default; only `--apply` mutates. We send `dry_run`
+/// explicitly so the intent is on the wire, not relying on a server default.
+fn cmd_fix(stream: UnixStream, apply: bool, on_ac: bool, output: Output) -> Result<i32, Fail> {
+    let mut params = serde_json::Map::new();
+    params.insert("dry_run".into(), serde_json::json!(!apply));
+    if on_ac {
+        params.insert("on_battery".into(), serde_json::json!(false));
+    }
+    let result = call_once(stream, "policy.apply", Some(serde_json::Value::Object(params)))?;
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<ApplyResult>(result.clone()) {
+            Ok(res) => print!("{}", render_apply(&res)),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
+/// `revert`: undo a transaction by id.
+fn cmd_revert(stream: UnixStream, txn_id: &str, output: Output) -> Result<i32, Fail> {
+    let params = Some(serde_json::json!({ "txn_id": txn_id }));
+    let result = call_once(stream, "policy.revert", params)?;
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<RevertResult>(result.clone()) {
+            Ok(res) => print!("{}", render_revert(&res)),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
+fn tier_str(t: Tier) -> &'static str {
+    match t {
+        Tier::T0 => "T0",
+        Tier::T1 => "T1",
+        Tier::T2 => "T2",
+        Tier::T3 => "T3",
+    }
+}
+
+fn risk_str(r: Risk) -> &'static str {
+    match r {
+        Risk::Low => "low",
+        Risk::Medium => "med",
+        Risk::High => "high",
+    }
+}
+
+/// One action line: `[T0 low] summary (from -> to)`.
+fn action_line(a: &PolicyAction) -> String {
+    let mut s = format!("[{} {}] {}", tier_str(a.tier), risk_str(a.risk), a.summary);
+    if let (Some(from), Some(to)) = (&a.from, &a.to) {
+        s.push_str(&format!("  ({from} -> {to})"));
+    }
+    s
+}
+
+/// `plan` on a tty: the actions that would apply, then an excluded section
+/// with each exclusion's reason.
+fn render_plan(plan: &Plan) -> String {
+    let ctx = if plan.on_battery { "battery" } else { "AC" };
+    let mut out = format!("power fixes for {ctx} — nothing applied (this is a plan)\n");
+    if plan.actions.is_empty() {
+        out.push_str("  (no actions would apply in this state)\n");
+    } else {
+        for a in &plan.actions {
+            out.push_str(&format!("  • {}\n", action_line(a)));
+            out.push_str(&format!("      id: {}\n", a.id));
+        }
+    }
+    if !plan.excluded.is_empty() {
+        out.push_str("excluded:\n");
+        for a in &plan.excluded {
+            let why = a.note.as_deref().unwrap_or("no reason given");
+            out.push_str(&format!("  - {} [{}]  — {}\n", a.summary, tier_str(a.tier), why));
+        }
+    }
+    out
+}
+
+/// `fix` on a tty: what changed (or would, on a dry run), plus the revert hint
+/// for a real apply.
+fn render_apply(res: &ApplyResult) -> String {
+    let mut out = String::new();
+    if res.dry_run {
+        out.push_str("dry run — nothing changed. These are the fixes that would apply:\n");
+    } else {
+        out.push_str("applied the following fixes:\n");
+    }
+    if res.applied.is_empty() {
+        out.push_str("  (nothing to apply)\n");
+    } else {
+        for a in &res.applied {
+            out.push_str(&format!("  • {}\n", action_line(a)));
+        }
+    }
+    if !res.failed.is_empty() {
+        out.push_str("could not apply (left unchanged):\n");
+        for a in &res.failed {
+            let why = a.note.as_deref().unwrap_or("failed");
+            out.push_str(&format!("  - {}  — {}\n", a.summary, why));
+        }
+    }
+    if !res.dry_run {
+        out.push_str(&format!("txn: {}\n", res.txn_id));
+        out.push_str(&format!("revert with: drowse revert {}\n", res.txn_id));
+    } else {
+        out.push_str("run `drowse fix --apply` to enact these.\n");
+    }
+    out
+}
+
+/// `revert` on a tty.
+fn render_revert(res: &RevertResult) -> String {
+    if res.already_reverted {
+        return format!("nothing to undo for {} (already reverted or unknown txn)\n", res.txn_id);
+    }
+    let mut out = format!("reverted txn {}:\n", res.txn_id);
+    for a in &res.reverted {
+        out.push_str(&format!("  • {}\n", action_line(a)));
+    }
+    out
 }
 
 fn print_json(v: &serde_json::Value) {

@@ -2,16 +2,26 @@
 //! engine, plus the timer arm/disarm policy. No sockets, no clocks.
 
 use crate::score::{FieldInfo, SysInfo};
-use crate::state::State;
+use crate::state::{Policy, State};
 use crate::{rpc, timer_plan};
-use drowse_api::{OffenderKind, RpcRequest, RpcResponse, Scorecard, SourceState, SourceStatus};
-use drowse_core::service::drive;
+use drowse_api::{
+    ApplyResult, ErrorCode, OffenderKind, Plan, PolicyAction, RevertResult, Risk, RpcRequest,
+    RpcResponse, Scorecard, SourceState, SourceStatus, Tier, SCHEMA,
+};
+use drowse_core::service::{drive, Router};
 use drowse_core::{
-    AttributionDelta, Collector, Engine, Field, Kind, Probe, RawOffender, Unit,
+    AttributionDelta, Collector, Engine, Field, Kind, PolicyEngine, PowerState, Probe, RawOffender,
+    Unit,
 };
 use serde_json::{json, Value};
 use std::io;
 use std::sync::{Arc, Mutex};
+
+/// Build the verb router with a stub (unavailable) policy engine. The policy
+/// verbs are exercised separately in the policy_* tests with a fake engine.
+fn router(st: Arc<Mutex<State>>) -> Router {
+    rpc::router(st, rpc::unavailable_policy("test: no policy engine"))
+}
 
 /// Scripted collector: returns pre-baked absolute samples tick by tick.
 struct Fake {
@@ -113,7 +123,7 @@ fn result(resp: RpcResponse) -> Value {
 #[test]
 fn session_start_is_idempotent() {
     let st = test_state();
-    let mut svc = rpc::router(st.clone());
+    let mut svc = router(st.clone());
 
     let a = result(drive(&mut svc, req("session.start", json!({"session_id": "x", "interval_ms": 1000}))));
     assert_eq!(a["session_id"], "x");
@@ -132,7 +142,7 @@ fn session_start_is_idempotent() {
 #[test]
 fn session_stop_is_idempotent() {
     let st = test_state();
-    let mut svc = rpc::router(st.clone());
+    let mut svc = router(st.clone());
     result(drive(&mut svc, req("session.start", json!({"session_id": "x"}))));
 
     let a = result(drive(&mut svc, req("session.stop", json!({"session_id": "x"}))));
@@ -147,7 +157,7 @@ fn session_stop_is_idempotent() {
 #[test]
 fn interval_below_minimum_is_usage_error() {
     let st = test_state();
-    let mut svc = rpc::router(st);
+    let mut svc = router(st);
     let resp = drive(&mut svc, req("session.start", json!({"interval_ms": 100})));
     let err = resp.error.expect("expected error");
     assert_eq!(err.code, -32602);
@@ -157,7 +167,7 @@ fn interval_below_minimum_is_usage_error() {
 #[test]
 fn score_get_shape_and_round_trip() {
     let st = test_state();
-    let mut svc = rpc::router(st.clone());
+    let mut svc = router(st.clone());
     result(drive(&mut svc, req("session.start", json!({"session_id": "s", "interval_ms": 1000}))));
 
     // Drive the sampler by hand: prime tick + one delta tick 2 s later.
@@ -209,7 +219,7 @@ fn score_get_shape_and_round_trip() {
 #[test]
 fn score_get_warmup_is_busy_and_retryable() {
     let st = test_state();
-    let mut svc = rpc::router(st);
+    let mut svc = router(st);
     result(drive(&mut svc, req("session.start", json!({"session_id": "s"}))));
     // No ticks yet -> busy, retryable, never a fake zero scorecard.
     let resp = drive(&mut svc, req("score.get", json!({})));
@@ -225,7 +235,7 @@ fn score_get_warmup_is_busy_and_retryable() {
 #[test]
 fn timer_disarms_when_last_session_stops() {
     let st = test_state();
-    let mut svc = rpc::router(st.clone());
+    let mut svc = router(st.clone());
 
     assert_eq!(st.lock().unwrap().min_interval_ms(), None);
     assert_eq!(timer_plan(None, 123), None, "idle daemon arms no timer");
@@ -259,7 +269,7 @@ fn timer_plan_aligns_absolute_expiry() {
 #[test]
 fn subscribe_requires_connection_and_registers() {
     let st = test_state();
-    let mut svc = rpc::router(st.clone());
+    let mut svc = router(st.clone());
 
     // No transport context -> internal error, not a phantom subscription.
     let resp = drive(&mut svc, req("subscribe", json!({"kinds": ["tick"]})));
@@ -457,7 +467,7 @@ fn offenders_unavailable_is_empty_with_reason_not_error() {
         SourceState::PermissionDenied,
         "attribution needs root (CAP_BPF)",
     ))));
-    let mut svc = rpc::router(st);
+    let mut svc = router(st);
     let resp = drive(&mut svc, req("offenders.get", json!({"limit": 5})));
     let v = result(resp); // result() asserts no RPC error
     assert_eq!(v["kind"], "offenders");
@@ -470,10 +480,117 @@ fn offenders_unavailable_is_empty_with_reason_not_error() {
 fn offenders_get_is_registered_and_defaults_empty() {
     // test_state has attribution ok but no window drained yet.
     let st = test_state();
-    let mut svc = rpc::router(st);
+    let mut svc = router(st);
     let v = result(drive(&mut svc, req("offenders.get", json!({}))));
     assert_eq!(v["kind"], "offenders");
     assert_eq!(v["offenders"].as_array().unwrap().len(), 0);
     assert_eq!(v["source"]["state"], "ok");
     assert!((v["meta"]["window_s"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Policy verbs: dry-run is the default (safety), plan reflects power state,
+// and revert needs a txn id. A fake engine stands in for drowse-policy.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FakePolicy;
+
+fn fake_action(id: &str) -> PolicyAction {
+    PolicyAction {
+        id: id.into(),
+        kind: "sysfs".into(),
+        summary: "set a knob".into(),
+        tier: Tier::T0,
+        risk: Risk::Low,
+        reversible: true,
+        from: Some("on".into()),
+        to: Some("auto".into()),
+        est_gain_min: None,
+        note: None,
+    }
+}
+
+impl PolicyEngine for FakePolicy {
+    fn plan(&self, state: PowerState) -> io::Result<Plan> {
+        Ok(Plan {
+            schema: SCHEMA,
+            kind: "plan".into(),
+            on_battery: state == PowerState::Battery,
+            actions: vec![fake_action("knob:epp")],
+            excluded: vec![],
+        })
+    }
+    fn apply(&mut self, _state: PowerState, dry_run: bool) -> io::Result<ApplyResult> {
+        Ok(ApplyResult {
+            schema: SCHEMA,
+            kind: "apply".into(),
+            txn_id: if dry_run { "dry-run".into() } else { "txn-1".into() },
+            dry_run,
+            applied: vec![fake_action("knob:epp")],
+            failed: vec![],
+        })
+    }
+    fn revert(&mut self, txn_id: &str) -> io::Result<RevertResult> {
+        Ok(RevertResult {
+            schema: SCHEMA,
+            kind: "revert".into(),
+            txn_id: txn_id.into(),
+            already_reverted: txn_id == "gone",
+            reverted: vec![fake_action("knob:epp")],
+        })
+    }
+}
+
+fn policy_router() -> Router {
+    let pol = Arc::new(Mutex::new(Policy::Ready(Box::new(FakePolicy))));
+    rpc::router(test_state(), pol)
+}
+
+#[test]
+fn policy_apply_defaults_to_dry_run() {
+    let mut r = policy_router();
+    // No dry_run field at all -> MUST be treated as dry-run (never mutate).
+    let v = result(drive(&mut r, req("policy.apply", json!({ "on_battery": true }))));
+    assert_eq!(v["kind"], "apply");
+    assert_eq!(v["dry_run"], json!(true), "missing dry_run must mean dry-run");
+    assert_eq!(v["txn_id"], "dry-run");
+}
+
+#[test]
+fn policy_apply_false_is_the_only_mutating_path() {
+    let mut r = policy_router();
+    let v = result(drive(&mut r, req("policy.apply", json!({ "dry_run": false, "on_battery": true }))));
+    assert_eq!(v["dry_run"], json!(false));
+    assert_eq!(v["txn_id"], "txn-1");
+}
+
+#[test]
+fn policy_plan_reflects_explicit_power_state() {
+    let mut r = policy_router();
+    let batt = result(drive(&mut r, req("policy.plan", json!({ "on_battery": true }))));
+    assert_eq!(batt["kind"], "plan");
+    assert_eq!(batt["on_battery"], json!(true));
+    let ac = result(drive(&mut r, req("policy.plan", json!({ "on_battery": false }))));
+    assert_eq!(ac["on_battery"], json!(false));
+}
+
+#[test]
+fn policy_revert_requires_txn_id_then_undoes() {
+    let mut r = policy_router();
+    let err = drive(&mut r, req("policy.revert", json!({}))).error.expect("usage error");
+    assert_eq!(err.data.unwrap().code, ErrorCode::Usage);
+    let ok = result(drive(&mut r, req("policy.revert", json!({ "txn_id": "txn-1" }))));
+    assert_eq!(ok["txn_id"], "txn-1");
+    assert_eq!(ok["already_reverted"], json!(false));
+}
+
+#[test]
+fn policy_verbs_map_unavailable_engine_to_typed_error() {
+    // The stub router helper carries an Unavailable(NotPresent) policy.
+    let mut r = router(test_state());
+    let err = drive(&mut r, req("policy.plan", json!({ "on_battery": true })))
+        .error
+        .expect("unavailable -> error");
+    assert_eq!(err.data.unwrap().code, ErrorCode::NotPresent);
 }

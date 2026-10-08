@@ -2,9 +2,10 @@
 //! stack. Handlers only transform state; arming/disarming the timer is the
 //! transport loop's job (it re-reads `min_interval_ms` after every dispatch).
 
-use crate::state::State;
-use drowse_api::{ErrorCode, ErrorData, RpcRequest, RpcResponse, SCHEMA};
+use crate::state::{Policy, State};
+use drowse_api::{ErrorCode, ErrorData, RpcRequest, RpcResponse, SourceState, SourceStatus, SCHEMA};
 use drowse_core::service::{drive, handler, Layer, Router, RpcFuture, Service};
+use drowse_core::PowerState;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::future::ready;
@@ -71,6 +72,10 @@ fn p_str(params: &Option<Value>, key: &str) -> Option<String> {
     Some(params.as_ref()?.get(key)?.as_str()?.to_string())
 }
 
+fn p_bool(params: &Option<Value>, key: &str) -> Option<bool> {
+    params.as_ref()?.get(key)?.as_bool()
+}
+
 fn usage(id: Option<Value>, detail: impl Into<String>) -> RpcResponse {
     let detail = detail.into();
     RpcResponse::err(
@@ -106,12 +111,70 @@ fn internal(id: Option<Value>, detail: impl Into<String>) -> RpcResponse {
     )
 }
 
+/// The policy engine's own `Unavailable` status mapped to an RPC error. Only a
+/// safety net: `drowse_policy::probe()` is always Ready.
+fn policy_unavailable(id: Option<Value>, status: &SourceStatus) -> RpcResponse {
+    let code = match status.state {
+        SourceState::PermissionDenied => ErrorCode::Permission,
+        SourceState::NotPresent => ErrorCode::NotPresent,
+        _ => ErrorCode::Internal,
+    };
+    let detail = status.detail.clone().unwrap_or_else(|| "policy engine unavailable".into());
+    RpcResponse::err(
+        id,
+        -32000,
+        detail.clone(),
+        Some(ErrorData { code, detail, retryable: false, hint: None }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Power-state detection for policy. Reads AC `online` directly from sysfs (no
+// sampler-lock involvement); falls back to the battery gauge via a brief State
+// lock, released before any policy call. Default Battery when unknown — the
+// safer context (a plan computed for battery is conservative).
+// ---------------------------------------------------------------------------
+
+fn read_ac_online() -> Option<bool> {
+    let base = std::path::Path::new("/sys/class/power_supply");
+    let mut fallback: Option<bool> = None;
+    for entry in std::fs::read_dir(base).ok()?.flatten() {
+        let dir = entry.path();
+        let is_mains = std::fs::read_to_string(dir.join("type"))
+            .map(|t| t.trim() == "Mains")
+            .unwrap_or(false);
+        if let Ok(s) = std::fs::read_to_string(dir.join("online")) {
+            let online = s.trim() == "1";
+            if is_mains {
+                return Some(online); // a Mains supply is the authoritative AC state
+            }
+            fallback.get_or_insert(online);
+        }
+    }
+    fallback
+}
+
+fn detect_power_state(explicit_on_battery: Option<bool>, st: &Arc<Mutex<State>>) -> PowerState {
+    if let Some(on_batt) = explicit_on_battery {
+        return if on_batt { PowerState::Battery } else { PowerState::Ac };
+    }
+    if let Some(ac_online) = read_ac_online() {
+        return if ac_online { PowerState::Ac } else { PowerState::Battery };
+    }
+    if let Some(discharging) = st.lock().unwrap().battery_discharging() {
+        return if discharging { PowerState::Battery } else { PowerState::Ac };
+    }
+    PowerState::Battery
+}
+
 // ---------------------------------------------------------------------------
 // The router.
 // ---------------------------------------------------------------------------
 
-/// Bare verb router (no logging) — used directly by tests.
-pub fn router(st: Arc<Mutex<State>>) -> Router {
+/// Bare verb router (no logging) — used directly by tests. The policy engine
+/// rides its OWN `Arc<Mutex<Policy>>`, separate from the sampler `State`, so a
+/// slow `apply()` never holds the sampler lock.
+pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Router {
     let s = st.clone();
     let system_check = handler(move |q: RpcRequest| {
         let st = s.lock().unwrap();
@@ -228,6 +291,51 @@ pub fn router(st: Arc<Mutex<State>>) -> Router {
         RpcResponse::ok(q.id, serde_json::to_value(off).unwrap())
     });
 
+    // -- policy verbs: the act layer. Each locks ONLY the policy mutex for the
+    //    engine call; power-state detection takes a brief, separate State lock
+    //    (released first), so a slow apply never blocks the sampler. --------
+    let s = st.clone();
+    let p = policy.clone();
+    let policy_plan = handler(move |q: RpcRequest| {
+        let state = detect_power_state(p_bool(&q.params, "on_battery"), &s);
+        match &*p.lock().unwrap() {
+            Policy::Unavailable(status) => policy_unavailable(q.id, status),
+            Policy::Ready(engine) => match engine.plan(state) {
+                Ok(plan) => RpcResponse::ok(q.id, serde_json::to_value(plan).unwrap()),
+                Err(e) => internal(q.id, format!("policy.plan failed: {e}")),
+            },
+        }
+    });
+
+    let s = st.clone();
+    let p = policy.clone();
+    let policy_apply = handler(move |q: RpcRequest| {
+        // dry_run DEFAULTS TO TRUE: a missing flag must never mutate the host.
+        let dry_run = p_bool(&q.params, "dry_run").unwrap_or(true);
+        let state = detect_power_state(p_bool(&q.params, "on_battery"), &s);
+        match &mut *p.lock().unwrap() {
+            Policy::Unavailable(status) => policy_unavailable(q.id, status),
+            Policy::Ready(engine) => match engine.apply(state, dry_run) {
+                Ok(res) => RpcResponse::ok(q.id, serde_json::to_value(res).unwrap()),
+                Err(e) => internal(q.id, format!("policy.apply failed: {e}")),
+            },
+        }
+    });
+
+    let p = policy.clone();
+    let policy_revert = handler(move |q: RpcRequest| {
+        let Some(txn_id) = p_str(&q.params, "txn_id") else {
+            return usage(q.id, "txn_id is required");
+        };
+        match &mut *p.lock().unwrap() {
+            Policy::Unavailable(status) => policy_unavailable(q.id, status),
+            Policy::Ready(engine) => match engine.revert(&txn_id) {
+                Ok(res) => RpcResponse::ok(q.id, serde_json::to_value(res).unwrap()),
+                Err(e) => internal(q.id, format!("policy.revert failed: {e}")),
+            },
+        }
+    });
+
     Router::new()
         .route("system.check", system_check)
         .route("session.start", session_start)
@@ -235,10 +343,23 @@ pub fn router(st: Arc<Mutex<State>>) -> Router {
         .route("session.list", session_list)
         .route("score.get", score_get)
         .route("offenders.get", offenders_get)
+        .route("policy.plan", policy_plan)
+        .route("policy.apply", policy_apply)
+        .route("policy.revert", policy_revert)
         .route("subscribe", subscribe)
 }
 
 /// The full production stack: router wrapped in the logging filter.
-pub fn service(st: Arc<Mutex<State>>) -> Log<Router> {
-    LogLayer.layer(router(st))
+pub fn service(st: Arc<Mutex<State>>, policy: Arc<Mutex<Policy>>) -> Log<Router> {
+    LogLayer.layer(router(st, policy))
+}
+
+/// Build an `Unavailable` policy handle. Test-only: production builds the
+/// handle from `drowse_policy::probe()`, which is always Ready.
+#[cfg(test)]
+pub fn unavailable_policy(detail: &str) -> Arc<Mutex<Policy>> {
+    Arc::new(Mutex::new(Policy::Unavailable(SourceStatus::err(
+        SourceState::NotPresent,
+        detail,
+    ))))
 }
