@@ -630,19 +630,20 @@ fn cmd_toggle(stream: UnixStream, output: Output) -> Result<i32, Fail> {
 /// One colored BAT label for a polybar custom/script module. Color reflects
 /// mode; a `*` marks power-save active. Pair with `click-left = drowse toggle`.
 fn render_polybar(st: &PowerStatus) -> String {
-    let color = if st.power_save_active {
-        COLOR_SAVING
+    // (color, trailing tag) make power-save state unmistakable in the bar:
+    // green "SAVE" when active, yellow on battery, blue on AC.
+    let (color, tag) = if st.power_save_active {
+        (COLOR_SAVING, " SAVE")
     } else if st.on_battery {
-        COLOR_BATTERY
+        (COLOR_BATTERY, "")
     } else {
-        COLOR_AC
+        (COLOR_AC, "")
     };
-    let mark = if st.power_save_active { "*" } else { "" };
     let pct = st
         .battery_pct
         .map(|p| format!(" {p:.0}%"))
         .unwrap_or_default();
-    format!("%{{F{color}}}BAT{mark}{pct}%{{F-}}\n")
+    format!("%{{F{color}}}BAT{pct}{tag}%{{F-}}\n")
 }
 
 /// Human one-liner for `drowse status`.
