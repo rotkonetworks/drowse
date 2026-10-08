@@ -292,6 +292,16 @@ impl State {
         None
     }
 
+    /// Battery charge percent from the slow lane, for `power.status`.
+    pub fn battery_capacity(&self) -> Option<f64> {
+        for (i, f) in self.slow_layout.iter().enumerate() {
+            if f.collector == "battery" && f.unit == Unit::Percent {
+                return self.slow_values.get(i).copied().flatten().map(|v| v as f64);
+            }
+        }
+        None
+    }
+
     /// Latest Sleep Efficiency + grade from recent history, for `power.status`.
     /// None until two ticks exist.
     pub fn latest_sleep_efficiency(&self) -> (Option<f64>, Option<drowse_api::Grade>) {

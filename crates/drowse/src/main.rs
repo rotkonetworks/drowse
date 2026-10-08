@@ -638,11 +638,11 @@ fn render_polybar(st: &PowerStatus) -> String {
         COLOR_AC
     };
     let mark = if st.power_save_active { "*" } else { "" };
-    let grade = st
-        .grade
-        .map(|g| format!(" {g:?}"))
+    let pct = st
+        .battery_pct
+        .map(|p| format!(" {p:.0}%"))
         .unwrap_or_default();
-    format!("%{{F{color}}}BAT{mark}{grade}%{{F-}}\n")
+    format!("%{{F{color}}}BAT{mark}{pct}%{{F-}}\n")
 }
 
 /// Human one-liner for `drowse status`.

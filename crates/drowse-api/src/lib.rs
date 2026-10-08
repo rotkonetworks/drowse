@@ -404,6 +404,9 @@ pub struct PowerStatus {
     pub sleep_efficiency: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grade: Option<Grade>,
+    /// Battery charge percent, for a status-bar label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_pct: Option<f64>,
 }
 
 /// Default socket path for the unprivileged user instance.

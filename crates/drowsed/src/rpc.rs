@@ -412,9 +412,10 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) -> Router
 fn build_power_status(st: &Arc<Mutex<State>>, policy: &Arc<Mutex<PolicyHandle>>) -> PowerStatus {
     let on_battery = detect_power_state(None, st) == PowerState::Battery;
     let active_txn_id = policy.lock().unwrap().active_txn.clone();
-    let (sleep_efficiency, grade) = {
+    let (sleep_efficiency, grade, battery_pct) = {
         let s = st.lock().unwrap();
-        s.latest_sleep_efficiency()
+        let (se, g) = s.latest_sleep_efficiency();
+        (se, g, s.battery_capacity())
     };
     PowerStatus {
         schema: SCHEMA,
@@ -424,6 +425,7 @@ fn build_power_status(st: &Arc<Mutex<State>>, policy: &Arc<Mutex<PolicyHandle>>)
         active_txn_id,
         sleep_efficiency,
         grade,
+        battery_pct,
     }
 }
 

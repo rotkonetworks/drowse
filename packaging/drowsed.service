@@ -1,0 +1,25 @@
+[Unit]
+Description=drowse package-idle daemon (sampler + eBPF attribution + policy)
+Documentation=https://github.com/
+After=multi-user.target
+
+[Service]
+Type=simple
+# Runs as root: eBPF attribution needs CAP_BPF/CAP_PERFMON, RAPL energy is
+# root-only, and the policy engine writes sysfs knobs / drives systemctl.
+ExecStart=/usr/local/bin/drowsed --socket /run/drowsed/sock --socket-mode 0666
+# RuntimeDirectory makes /run/drowsed (0755) owned by this service and cleaned
+# on stop; --socket-mode 0666 then makes the socket reachable by the user's bar.
+RuntimeDirectory=drowsed
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+# Harden what we can without blocking the legitimate privileged work.
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectControlGroups=false
+# --auto-apply is intentionally omitted: enable it only once you trust the
+# plan (systemctl edit drowsed → append --auto-apply to ExecStart).
+
+[Install]
+WantedBy=multi-user.target

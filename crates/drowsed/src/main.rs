@@ -106,6 +106,8 @@ fn main() {
     let mut root = PathBuf::from("/");
     let mut slow_cadence_ms = DEFAULT_SLOW_CADENCE_MS;
     let mut attr_cadence_ms = DEFAULT_ATTR_CADENCE_MS;
+    let mut socket_mode: Option<u32> = None;
+    let mut auto_apply = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -125,6 +127,18 @@ fn main() {
                 Some(n) if n >= 100 => attr_cadence_ms = n,
                 _ => die_usage("--attr-cadence-ms requires an integer >= 100"),
             },
+            // Octal mode applied to the control socket after bind, so a system
+            // daemon's socket is reachable by the user's bar/CLI (e.g. 0666).
+            "--socket-mode" => match args.next() {
+                Some(s) => match u32::from_str_radix(s.trim_start_matches("0o"), 8) {
+                    Ok(m) => socket_mode = Some(m),
+                    Err(_) => die_usage("--socket-mode requires an octal mode, e.g. 0666"),
+                },
+                None => die_usage("--socket-mode requires a mode"),
+            },
+            // Automatically apply the battery plan on unplug, revert on plug.
+            // Off by default; a real mutation gate.
+            "--auto-apply" => auto_apply = true,
             "--help" | "-h" => {
                 println!(
                     "drowsed - drowse sampling daemon (JSON-RPC 2.0, newline-delimited)\n\n\
@@ -133,7 +147,9 @@ fn main() {
                      --socket PATH        control socket (default: $XDG_RUNTIME_DIR/drowsed.sock)\n  \
                      --root PATH          sysfs root, for fixture testing (default: /)\n  \
                      --slow-cadence-ms N  slow-lane (battery) sampling period (default: 10000)\n  \
-                     --attr-cadence-ms N  eBPF attribution drain period (default: 10000)"
+                     --attr-cadence-ms N  eBPF attribution drain period (default: 10000)\n  \
+                     --socket-mode OCTAL  chmod the socket after bind (e.g. 0666 for a system daemon)\n  \
+                     --auto-apply         apply the battery plan on unplug, revert on plug (default off)"
                 );
                 return;
             }
@@ -141,7 +157,7 @@ fn main() {
         }
     }
 
-    if let Err(e) = run(&socket_path, &root, slow_cadence_ms, attr_cadence_ms) {
+    if let Err(e) = run(&socket_path, &root, slow_cadence_ms, attr_cadence_ms, socket_mode, auto_apply) {
         eprintln!("drowsed: fatal: {e}");
         std::process::exit(drowse_api::ErrorCode::Internal.exit_code());
     }
@@ -186,11 +202,14 @@ fn partition_probes(probes: Vec<Probe>) -> (Vec<Probe>, Vec<Probe>) {
     (fast, slow)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     socket_path: &Path,
     root: &Path,
     slow_cadence_ms: u64,
     attr_cadence_ms: u64,
+    socket_mode: Option<u32>,
+    auto_apply: bool,
 ) -> std::io::Result<()> {
     // Refuse to steal a live socket; replace a stale one.
     if socket_path.exists() {
@@ -233,7 +252,13 @@ fn run(
         attr_source,
         sysinfo(),
     )));
-    let mut svc = rpc::service(st.clone(), policy);
+    let mut svc = rpc::service(st.clone(), policy.clone());
+
+    // Auto-apply watcher (opt-in): on AC->battery apply the battery plan and
+    // record the txn; on battery->AC revert it. Off unless --auto-apply.
+    if auto_apply {
+        spawn_auto_apply(st.clone(), policy.clone());
+    }
 
     // Both lanes park on this until a session exists, so an idle daemon wakes
     // neither the fast (ppoll) thread nor either background thread.
@@ -248,6 +273,10 @@ fn run(
 
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
+    if let Some(mode) = socket_mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(mode))?;
+    }
     let _guard = SocketGuard(socket_path.to_path_buf());
 
     // One timerfd for the daemon's lifetime; disarmed = never fires.
@@ -365,6 +394,83 @@ fn run(
             slow_wake.notify_all();
         }
     }
+}
+
+/// Read whether the machine is on battery, directly from sysfs (no sampler
+/// lock). None when no power supply reports `online`.
+fn on_battery_now(st: &Arc<Mutex<State>>) -> Option<bool> {
+    let base = std::path::Path::new("/sys/class/power_supply");
+    let mut fallback: Option<bool> = None;
+    if let Ok(dir) = std::fs::read_dir(base) {
+        for entry in dir.flatten() {
+            let p = entry.path();
+            let is_mains = std::fs::read_to_string(p.join("type"))
+                .map(|t| t.trim() == "Mains")
+                .unwrap_or(false);
+            if let Ok(s) = std::fs::read_to_string(p.join("online")) {
+                let online = s.trim() == "1";
+                if is_mains {
+                    return Some(!online);
+                }
+                fallback.get_or_insert(!online);
+            }
+        }
+    }
+    fallback.or_else(|| st.lock().unwrap().battery_discharging())
+}
+
+/// The auto-apply watcher (opt-in via `--auto-apply`): a low-rate thread that
+/// applies the battery power-save plan on unplug and reverts it on plug. It
+/// holds only the policy mutex, never the sampler lock, so a slow apply can't
+/// dent the self-footprint budget. Default off — a real mutation gate.
+fn spawn_auto_apply(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) {
+    use drowse_core::PowerState;
+    std::thread::spawn(move || {
+        let mut last: Option<bool> = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let Some(on_batt) = on_battery_now(&st) else { continue };
+            if Some(on_batt) == last {
+                continue;
+            }
+            last = Some(on_batt);
+
+            let mut g = policy.lock().unwrap();
+            let active = g.active_txn.clone();
+            // None = leave active_txn as-is; Some(x) = set it to x.
+            let next: Option<Option<String>> = match &mut g.engine {
+                Policy::Ready(engine) => {
+                    if on_batt && active.is_none() {
+                        match engine.apply(PowerState::Battery, false) {
+                            Ok(res) if !res.dry_run => {
+                                eprintln!("drowsed: auto-applied battery plan ({})", res.txn_id);
+                                Some(Some(res.txn_id))
+                            }
+                            Ok(_) => None,
+                            Err(e) => {
+                                eprintln!("drowsed: auto-apply failed: {e}");
+                                None
+                            }
+                        }
+                    } else if !on_batt {
+                        if let Some(txn) = &active {
+                            let _ = engine.revert(txn);
+                            eprintln!("drowsed: auto-reverted on AC ({txn})");
+                            Some(None)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Policy::Unavailable(_) => None,
+            };
+            if let Some(v) = next {
+                g.active_txn = v;
+            }
+        }
+    });
 }
 
 /// The slow lane: a dedicated thread owning the high-latency collectors. It
