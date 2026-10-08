@@ -1,0 +1,7 @@
+[Unit]
+Description=Record one drowse power/battery metrics sample
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/drowse-record
