@@ -13,14 +13,14 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use drowse_api::{RpcRequest, RpcResponse};
+use drowse_api::{RpcRequest, RpcResponse, SourceStatus};
 use drowse_core::service::{drive, Service};
 use rustix::event::{PollFd, PollFlags};
 use rustix::time::{
     timerfd_create, timerfd_settime, Itimerspec, TimerfdClockId, TimerfdFlags,
     TimerfdTimerFlags, Timespec,
 };
-use drowse_core::{Collector, Engine, Probe};
+use drowse_core::{Attributor, Collector, Engine, Probe};
 use state::{boottime_ns, unix_ms, State};
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 /// Default slow-lane cadence: battery gauges change slowly, and each read
 /// stalls on the EC, so it is read far less often than the fast tick.
 const DEFAULT_SLOW_CADENCE_MS: u64 = 10_000;
+/// Default attribution drain cadence: the eBPF maps accumulate in-kernel, so
+/// one drain every 10 s is enough and keeps userspace/kernel crossings rare.
+const DEFAULT_ATTR_CADENCE_MS: u64 = 10_000;
 
 /// Notifications are dropped (never block the sampler) once a client's
 /// outgoing buffer exceeds this.
@@ -102,6 +105,7 @@ fn main() {
     let mut socket_path = drowse_api::user_socket_path();
     let mut root = PathBuf::from("/");
     let mut slow_cadence_ms = DEFAULT_SLOW_CADENCE_MS;
+    let mut attr_cadence_ms = DEFAULT_ATTR_CADENCE_MS;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -117,14 +121,19 @@ fn main() {
                 Some(n) if n >= 100 => slow_cadence_ms = n,
                 _ => die_usage("--slow-cadence-ms requires an integer >= 100"),
             },
+            "--attr-cadence-ms" => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) if n >= 100 => attr_cadence_ms = n,
+                _ => die_usage("--attr-cadence-ms requires an integer >= 100"),
+            },
             "--help" | "-h" => {
                 println!(
                     "drowsed - drowse sampling daemon (JSON-RPC 2.0, newline-delimited)\n\n\
-                     USAGE: drowsed [--socket PATH] [--root PATH] [--slow-cadence-ms N]\n\n\
+                     USAGE: drowsed [--socket PATH] [--root PATH] [--slow-cadence-ms N] [--attr-cadence-ms N]\n\n\
                      OPTIONS:\n  \
                      --socket PATH        control socket (default: $XDG_RUNTIME_DIR/drowsed.sock)\n  \
                      --root PATH          sysfs root, for fixture testing (default: /)\n  \
-                     --slow-cadence-ms N  slow-lane (battery) sampling period (default: 10000)"
+                     --slow-cadence-ms N  slow-lane (battery) sampling period (default: 10000)\n  \
+                     --attr-cadence-ms N  eBPF attribution drain period (default: 10000)"
                 );
                 return;
             }
@@ -132,7 +141,7 @@ fn main() {
         }
     }
 
-    if let Err(e) = run(&socket_path, &root, slow_cadence_ms) {
+    if let Err(e) = run(&socket_path, &root, slow_cadence_ms, attr_cadence_ms) {
         eprintln!("drowsed: fatal: {e}");
         std::process::exit(drowse_api::ErrorCode::Internal.exit_code());
     }
@@ -177,7 +186,12 @@ fn partition_probes(probes: Vec<Probe>) -> (Vec<Probe>, Vec<Probe>) {
     (fast, slow)
 }
 
-fn run(socket_path: &Path, root: &Path, slow_cadence_ms: u64) -> std::io::Result<()> {
+fn run(
+    socket_path: &Path,
+    root: &Path,
+    slow_cadence_ms: u64,
+    attr_cadence_ms: u64,
+) -> std::io::Result<()> {
     // Refuse to steal a live socket; replace a stale one.
     if socket_path.exists() {
         if UnixStream::connect(socket_path).is_ok() {
@@ -193,20 +207,33 @@ fn run(socket_path: &Path, root: &Path, slow_cadence_ms: u64) -> std::io::Result
     let slow_engine = Engine::new(slow_probes);
     let slow_layout = score::layout_of(&slow_engine);
 
+    // Attribution (eBPF): Ready needs root; Unavailable unprivileged is a typed
+    // value, carried through to offenders.get as its source — never an error.
+    let (attr_source, attributor) = match drowse_ebpf::probe() {
+        drowse_core::AttributorProbe::Ready(a) => (SourceStatus::ok(), Some(a)),
+        drowse_core::AttributorProbe::Unavailable(status) => (status, None),
+    };
+    eprintln!("drowsed: attribution {:?}", attr_source.state);
+
     let st = Arc::new(Mutex::new(State::new(
         fast_engine,
         slow_layout,
         slow_cadence_ms,
+        attr_source,
         sysinfo(),
     )));
     let mut svc = rpc::service(st.clone());
 
-    // The slow lane parks on this until a session exists, so an idle daemon
-    // wakes neither the fast (ppoll) nor the slow thread.
-    let slow_wake = Arc::new(Condvar::new());
+    // Both lanes park on this until a session exists, so an idle daemon wakes
+    // neither the fast (ppoll) thread nor either background thread.
+    let wake = Arc::new(Condvar::new());
     if has_slow {
-        spawn_slow_lane(st.clone(), slow_wake.clone(), slow_engine, slow_cadence_ms);
+        spawn_slow_lane(st.clone(), wake.clone(), slow_engine, slow_cadence_ms);
     }
+    if let Some(attributor) = attributor {
+        spawn_attribution_lane(st.clone(), wake.clone(), attributor, attr_cadence_ms);
+    }
+    let slow_wake = wake;
 
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
@@ -376,6 +403,58 @@ fn spawn_slow_lane(
             }
         })
         .expect("spawn slow lane thread");
+}
+
+/// The attribution lane: a dedicated thread owning the eBPF attributor. It
+/// drains the in-kernel counter maps on its own cadence and publishes each
+/// window into shared `State`, so `offenders.get` never blocks on the drain.
+/// Like the slow lane it parks while sessionless. `drain` is delete-on-read,
+/// so each published window covers exactly the wall time since the prior
+/// drain; counts accumulated while parked are discarded on unpark, so a
+/// window is always a clean cadence-width measurement.
+fn spawn_attribution_lane(
+    st: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    mut attributor: Box<dyn Attributor>,
+    cadence_ms: u64,
+) {
+    std::thread::Builder::new()
+        .name("drowse-attr".into())
+        .spawn(move || {
+            // Zero the kernel counters at startup so the first real window does
+            // not fold in everything since program load.
+            let _ = attributor.drain();
+            loop {
+                // Park (zero wakeups) until at least one session is running.
+                {
+                    let guard = st.lock().unwrap();
+                    let _g = wake
+                        .wait_while(guard, |s| s.sessions.is_empty())
+                        .unwrap();
+                }
+                // Discard counts accumulated while parked; start a clean window.
+                let _ = attributor.drain();
+                let mut prev_ns = boottime_ns();
+                loop {
+                    std::thread::sleep(Duration::from_millis(cadence_ms));
+                    let now_ns = boottime_ns();
+                    match attributor.drain() {
+                        Ok(delta) => {
+                            let window_ns = now_ns.saturating_sub(prev_ns);
+                            prev_ns = now_ns;
+                            let n = delta.offenders.len();
+                            st.lock().unwrap().publish_attribution(delta, window_ns, unix_ms());
+                            eprintln!("drowsed: attribution drained {n} offenders");
+                        }
+                        Err(e) => eprintln!("drowsed: attribution drain failed: {e}"),
+                    }
+                    if st.lock().unwrap().sessions.is_empty() {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn attribution lane thread");
 }
 
 /// Pure timer policy: what the timerfd should be set to for a desired

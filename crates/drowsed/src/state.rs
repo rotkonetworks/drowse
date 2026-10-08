@@ -3,8 +3,8 @@
 //! unit-testable without a socket.
 
 use crate::score::{self, FieldInfo, SysInfo, TickRecord};
-use drowse_api::{Scorecard, SourceStatus};
-use drowse_core::Engine;
+use drowse_api::{Offenders, Scorecard, SourceStatus};
+use drowse_core::{AttributionDelta, Engine, RawOffender};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,13 +46,32 @@ pub struct State {
     pub slow_unix_ms: u64,
     /// The slow lane's cadence; staleness threshold is 3x this.
     pub slow_cadence_ms: u64,
+
+    // -- attribution lane: last window drained by the eBPF attributor ---------
+    /// Availability of the attribution subsystem (ok when eBPF loaded, else the
+    /// probe's typed reason — e.g. PermissionDenied unprivileged).
+    pub attr_source: SourceStatus,
+    /// Last published attribution window; None until the first drain lands.
+    pub attr: Option<AttrWindow>,
+}
+
+/// One drained attribution window: per-offender counts and the wall time they
+/// accumulated over. `offenders.get` divides counts by the window for rates,
+/// so it never blocks on the attributor — it reads this last snapshot.
+pub struct AttrWindow {
+    pub offenders: Vec<RawOffender>,
+    pub observer_wakeups: u64,
+    pub window_ns: u64,
+    pub unix_ms: u64,
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Engine,
         slow_layout: Vec<FieldInfo>,
         slow_cadence_ms: u64,
+        attr_source: SourceStatus,
         sysinfo: SysInfo,
     ) -> State {
         let mut combined_layout: Vec<FieldInfo> = score::layout_of(&engine);
@@ -71,6 +90,37 @@ impl State {
             slow_values,
             slow_unix_ms: 0,
             slow_cadence_ms,
+            attr_source,
+            attr: None,
+        }
+    }
+
+    /// Publish a drained attribution window (called by the attribution thread,
+    /// off the sampler critical path).
+    pub fn publish_attribution(&mut self, delta: AttributionDelta, window_ns: u64, unix_ms: u64) {
+        self.attr = Some(AttrWindow {
+            offenders: delta.offenders,
+            observer_wakeups: delta.observer_wakeups,
+            window_ns,
+            unix_ms,
+        });
+    }
+
+    /// Build the ranked offender table from the last published window. Always
+    /// a valid `Offenders`: when attribution is unavailable or no window has
+    /// been drained yet, the list is empty and `source` explains why.
+    pub fn make_offenders(&self, limit: usize) -> Offenders {
+        match &self.attr {
+            Some(w) => score::offenders(
+                &w.offenders,
+                w.observer_wakeups,
+                w.window_ns,
+                w.unix_ms,
+                &self.attr_source,
+                &self.sysinfo,
+                limit,
+            ),
+            None => score::offenders(&[], 0, 0, unix_ms(), &self.attr_source, &self.sysinfo, limit),
         }
     }
 

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+pub const DEFAULT_OFFENDER_LIMIT: u64 = 20;
 pub const MIN_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 pub const DEFAULT_WINDOW_S: f64 = 10.0;
@@ -218,12 +219,22 @@ pub fn router(st: Arc<Mutex<State>>) -> Router {
         RpcResponse::ok(q.id, json!({ "subscribed": true, "kinds": kinds }))
     });
 
+    let s = st.clone();
+    let offenders_get = handler(move |q: RpcRequest| {
+        let limit = p_u64(&q.params, "limit").unwrap_or(DEFAULT_OFFENDER_LIMIT) as usize;
+        // `window_s` is accepted for API symmetry; the effective window is the
+        // last drain's, reported truthfully in meta.window_s.
+        let off = s.lock().unwrap().make_offenders(limit);
+        RpcResponse::ok(q.id, serde_json::to_value(off).unwrap())
+    });
+
     Router::new()
         .route("system.check", system_check)
         .route("session.start", session_start)
         .route("session.stop", session_stop)
         .route("session.list", session_list)
         .route("score.get", score_get)
+        .route("offenders.get", offenders_get)
         .route("subscribe", subscribe)
 }
 

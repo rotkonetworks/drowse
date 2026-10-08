@@ -1,16 +1,20 @@
 //! drowse: CLI client. Each subcommand is exactly one RPC plus a formatter;
 //! JSON is the default output when stdout is not a tty.
 //!
-//! Subcommand -> RPC mapping (M1):
-//!   drowse check [--gate A..F]  -> score.get     (one-shot inline sample)
-//!   drowse score [--window N]   -> score.get     (params: {"window_s": N})
-//!   drowse watch                -> subscribe     (one line per tick until Ctrl-C)
+//! Subcommand -> RPC mapping (M1/M2):
+//!   drowse check [--gate A..F]        -> score.get     (one-shot inline sample)
+//!   drowse score [--window N]         -> score.get     (params: {"window_s": N})
+//!   drowse watch                      -> subscribe     (one line per tick)
+//!   drowse offenders [--window N]     -> offenders.get (ranked by battery cost)
+//!                    [--top K]
 //!
 //! Exit codes: 0 success; ErrorCode::exit_code() for RPC errors (2 usage,
 //! 10 permission, 11 not-present, 12 daemon unreachable, 14 session unknown,
 //! 15 busy, 16 kernel, 1 internal); 20 when --gate is not met.
 
-use drowse_api::{ErrorCode, Grade, RpcRequest, RpcResponse, Scorecard, SourceState};
+use drowse_api::{
+    ErrorCode, Grade, Offenders, RpcRequest, RpcResponse, Scorecard, SourceState,
+};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -25,9 +29,11 @@ const USAGE: &str = "drowse - package idle health, agent-first
 USAGE: drowse [--json|--table] [--socket PATH] <command>
 
 COMMANDS:
-  check [--gate A..F]   one-shot health check (exit 20 if grade below the bar)
-  score [--window N]    fetch the current scorecard (window in seconds)
-  watch                 stream one score line per tick until Ctrl-C
+  check [--gate A..F]        one-shot health check (exit 20 if grade below the bar)
+  score [--window N]         fetch the current scorecard (window in seconds)
+  watch                      stream one score line per tick until Ctrl-C
+  offenders [--window N]     who wakes the CPU, ranked by battery cost
+            [--top K]        (needs the root daemon for eBPF attribution)
 
 OUTPUT: human text on a tty, JSON otherwise; --json / --table force either.
 ";
@@ -56,6 +62,7 @@ enum Cmd {
     Check { gate: Option<Grade> },
     Score { window_s: Option<f64> },
     Watch,
+    Offenders { window_s: Option<f64>, top: Option<usize> },
 }
 
 struct Fail {
@@ -98,6 +105,7 @@ fn run() -> i32 {
             cmd_scorecard(stream, "score.get", params, cli.output, None)
         }
         Cmd::Watch => cmd_watch(stream, cli.output),
+        Cmd::Offenders { window_s, top } => cmd_offenders(stream, window_s, top, cli.output),
     };
     match r {
         Ok(code) => code,
@@ -114,6 +122,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
     let mut cmd: Option<String> = None;
     let mut gate: Option<Grade> = None;
     let mut window_s: Option<f64> = None;
+    let mut top: Option<usize> = None;
 
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -145,6 +154,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
                     .ok_or_else(|| Fail::usage(format!("--window takes seconds, not {v:?}")))?;
                 window_s = Some(w);
             }
+            "--top" => {
+                let v = take_value("--top", inline.take(), &mut it)?;
+                let k = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| *k > 0)
+                    .ok_or_else(|| Fail::usage(format!("--top takes a count > 0, not {v:?}")))?;
+                top = Some(k);
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -155,24 +173,32 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Fail> {
         }
     }
 
+    // `--gate` is check-only; `--top` is offenders-only; `--window` serves
+    // score and offenders.
     let cmd = match cmd.as_deref() {
         Some("check") => {
-            if window_s.is_some() {
-                return Err(Fail::usage("--window only applies to `score`"));
+            if window_s.is_some() || top.is_some() {
+                return Err(Fail::usage("`check` takes no --window/--top"));
             }
             Cmd::Check { gate }
         }
         Some("score") => {
-            if gate.is_some() {
-                return Err(Fail::usage("--gate only applies to `check`"));
+            if gate.is_some() || top.is_some() {
+                return Err(Fail::usage("`score` takes no --gate/--top"));
             }
             Cmd::Score { window_s }
         }
         Some("watch") => {
-            if gate.is_some() || window_s.is_some() {
-                return Err(Fail::usage("`watch` takes no --gate/--window"));
+            if gate.is_some() || window_s.is_some() || top.is_some() {
+                return Err(Fail::usage("`watch` takes no --gate/--window/--top"));
             }
             Cmd::Watch
+        }
+        Some("offenders") => {
+            if gate.is_some() {
+                return Err(Fail::usage("--gate only applies to `check`"));
+            }
+            Cmd::Offenders { window_s, top }
         }
         Some(other) => return Err(Fail::usage(format!("unknown command {other:?}"))),
         None => return Err(Fail::usage("missing command")),
@@ -385,6 +411,34 @@ fn cmd_watch(mut stream: UnixStream, output: Output) -> Result<i32, Fail> {
     Ok(0)
 }
 
+/// `offenders`: one call, a table ranked by battery cost (package-sleep
+/// breaks). JSON by default when piped; a human table on a tty.
+fn cmd_offenders(
+    stream: UnixStream,
+    window_s: Option<f64>,
+    top: Option<usize>,
+    output: Output,
+) -> Result<i32, Fail> {
+    let mut params = serde_json::Map::new();
+    if let Some(w) = window_s {
+        params.insert("window_s".into(), serde_json::json!(w));
+    }
+    if let Some(k) = top {
+        params.insert("limit".into(), serde_json::json!(k));
+    }
+    let params = (!params.is_empty()).then_some(serde_json::Value::Object(params));
+
+    let result = call_once(stream, "offenders.get", params)?;
+    match output {
+        Output::Json => print_json(&result),
+        Output::Table => match serde_json::from_value::<Offenders>(result.clone()) {
+            Ok(off) => print!("{}", render_offenders(&off)),
+            Err(_) => print_json(&result),
+        },
+    }
+    Ok(0)
+}
+
 fn print_json(v: &serde_json::Value) {
     if std::io::stdout().is_terminal() {
         println!("{}", serde_json::to_string_pretty(v).expect("value re-serializes"));
@@ -533,6 +587,69 @@ fn render_tick(card: &Scorecard) -> String {
     line
 }
 
+/// A per-second rate: whole at a glance, one decimal only when sub-10.
+fn fmt_per_s(r: f64) -> String {
+    if r >= 10.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r:.1}")
+    }
+}
+
+/// Human rendering of the offender table (`offenders` on a tty). Ranked by
+/// battery cost — package-sleep breaks — which is the point: raw wakeups are
+/// dominated by harmless timers; the breaks that shatter all-core-idle windows
+/// are what drains the battery.
+fn render_offenders(off: &Offenders) -> String {
+    let mut out = String::new();
+
+    // Attribution is a privileged subsystem; say so plainly when it's missing
+    // rather than implying the machine is clean.
+    if off.source.state != SourceState::Ok {
+        out.push_str(&format!(
+            "attribution unavailable: {}\n",
+            source_phrase(off.source.state, off.source.detail.as_deref())
+        ));
+        out.push_str("  eBPF wakeup attribution needs the root daemon — run drowsed as root.\n");
+        return out;
+    }
+
+    if off.offenders.is_empty() {
+        out.push_str(&format!(
+            "no wakeup offenders recorded over {:.0}s on {} yet.\n",
+            off.meta.window_s, off.meta.hostname
+        ));
+        out.push_str("  Keep a session running so the attribution lane drains, then retry.\n");
+        return out;
+    }
+
+    out.push_str(&format!(
+        "wakeup offenders over {:.0}s on {} — ranked by battery cost (package-sleep breaks)\n",
+        off.meta.window_s, off.meta.hostname
+    ));
+    out.push_str(&format!(
+        "  {:>2}  {:<30}  {:>6}  {:>6}  {:>5}\n",
+        "#", "offender", "pkg/s", "wake/s", "share"
+    ));
+    for (i, o) in off.offenders.iter().enumerate() {
+        out.push_str(&format!(
+            "  {:>2}  {:<30}  {:>6}  {:>6}  {:>4.0}%\n",
+            i + 1,
+            o.id,
+            fmt_per_s(o.pkg_breaks_per_s),
+            fmt_per_s(o.wakeups_per_s),
+            o.share * 100.0,
+        ));
+    }
+    if let Some(obs) = off.observer_wakeups_per_s {
+        out.push_str(&format!(
+            "drowse's own wakeups: {}/s (counted honestly, not ranked)\n",
+            fmt_per_s(obs)
+        ));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests: formatter and gate logic on hand-built scorecards; no daemon.
 // ---------------------------------------------------------------------------
@@ -540,7 +657,7 @@ fn render_tick(card: &Scorecard) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drowse_api::{Battery, Meta, Score, SourceStatus};
+    use drowse_api::{Battery, Meta, Offender, OffenderKind, Score, SourceStatus};
     use std::collections::BTreeMap;
 
     fn card() -> Scorecard {
@@ -657,5 +774,73 @@ mod tests {
             source_phrase(SourceState::Degraded, Some("battery hidden by firmware")),
             "degraded — battery hidden by firmware"
         );
+    }
+
+    fn offenders_fixture(source: SourceStatus, rows: Vec<Offender>) -> Offenders {
+        Offenders {
+            schema: drowse_api::SCHEMA,
+            kind: "offenders".into(),
+            meta: Meta {
+                hostname: "pocket4".into(),
+                kernel: "7.2".into(),
+                sampled_at_unix_ms: 0,
+                window_s: 10.0,
+                ticks: 1,
+                degraded: source.state != SourceState::Ok,
+            },
+            source,
+            offenders: rows,
+            observer_wakeups_per_s: Some(0.5),
+            window_ms_mean: None,
+        }
+    }
+
+    fn offender(id: &str, kind: OffenderKind, pid: Option<u32>, wake: f64, pkg: f64, share: f64) -> Offender {
+        Offender {
+            id: id.into(),
+            kind,
+            summary: "x".into(),
+            wakeups_per_s: wake,
+            idle_breaks_per_s: pkg,
+            pkg_breaks_per_s: pkg,
+            pid,
+            share,
+        }
+    }
+
+    #[test]
+    fn offenders_table_leads_with_battery_cost() {
+        let off = offenders_fixture(
+            SourceStatus::ok(),
+            vec![
+                offender("proc:1663:syncthing", OffenderKind::Process, Some(1663), 5.0, 4.0, 0.05),
+                offender("timer:hrtimer_wakeup", OffenderKind::Timer, None, 100.0, 0.0, 0.95),
+            ],
+        );
+        let out = render_offenders(&off);
+        assert!(out.contains("ranked by battery cost (package-sleep breaks)"), "{out}");
+        // Server ranks; the renderer keeps order — syncthing (high pkg) first.
+        let sync_at = out.find("proc:1663:syncthing").unwrap();
+        let timer_at = out.find("timer:hrtimer_wakeup").unwrap();
+        assert!(sync_at < timer_at, "battery-costly offender must be listed first");
+        assert!(out.contains("pkg/s"));
+        assert!(out.contains("drowse's own wakeups: 0.5/s"));
+    }
+
+    #[test]
+    fn offenders_unavailable_says_root_needed() {
+        let off = offenders_fixture(
+            SourceStatus::err(SourceState::PermissionDenied, "attribution needs root (CAP_BPF)"),
+            vec![],
+        );
+        let out = render_offenders(&off);
+        assert!(out.contains("attribution unavailable"), "{out}");
+        assert!(out.contains("root daemon"), "must point the user at the root daemon: {out}");
+    }
+
+    #[test]
+    fn offenders_empty_but_available_explains_warmup() {
+        let out = render_offenders(&offenders_fixture(SourceStatus::ok(), vec![]));
+        assert!(out.contains("no wakeup offenders recorded"), "{out}");
     }
 }

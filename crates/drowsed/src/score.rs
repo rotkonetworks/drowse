@@ -238,3 +238,122 @@ pub fn assemble(
         package_power_w: pkg_any.then_some(pkg_w),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attribution assembly: the M2 payload of `offenders.get`. Pure, like
+// `assemble` above — RawOffenders + a window in, wire `Offenders` out, so it
+// unit-tests without eBPF.
+// ---------------------------------------------------------------------------
+
+use drowse_api::{Offender, OffenderKind, Offenders};
+use drowse_core::RawOffender;
+
+/// Id prefix per kind: "proc"/"timer"/"irq"/"softirq"/"workqueue".
+fn kind_slug(k: OffenderKind) -> &'static str {
+    match k {
+        OffenderKind::Process => "proc",
+        OffenderKind::Timer => "timer",
+        OffenderKind::Irq => "irq",
+        OffenderKind::Softirq => "softirq",
+        OffenderKind::Workqueue => "workqueue",
+    }
+}
+
+/// counts ÷ window; 0 when the window is empty (never divide by zero).
+fn rate(count: u64, window_s: f64) -> f64 {
+    if window_s > 0.0 { count as f64 / window_s } else { 0.0 }
+}
+
+/// Human rate: whole numbers at a glance, a decimal only when sub-10/s.
+fn fmt_rate(r: f64) -> String {
+    if r >= 10.0 {
+        format!("{r:.0}x/s")
+    } else {
+        format!("{r:.1}x/s")
+    }
+}
+
+/// Assemble the ranked offender table. `window_ns` is the wall time the
+/// `raw` counts accumulated over; `source` is the attribution subsystem's own
+/// availability (ok when eBPF loaded, else the probe's typed reason). When the
+/// subsystem is unavailable `raw` is empty and the result is a valid, empty
+/// table — never an error.
+#[allow(clippy::too_many_arguments)]
+pub fn offenders(
+    raw: &[RawOffender],
+    observer_wakeups: u64,
+    window_ns: u64,
+    sampled_at_unix_ms: u64,
+    source: &SourceStatus,
+    sysinfo: &SysInfo,
+    limit: usize,
+) -> Offenders {
+    let window_s = window_ns as f64 / 1e9;
+    let total_wakeups: u64 = raw.iter().map(|o| o.wakeups).sum();
+
+    let mut rows: Vec<Offender> = raw
+        .iter()
+        .map(|o| {
+            let id = match (o.kind, o.pid) {
+                (OffenderKind::Process, Some(pid)) => format!("proc:{pid}:{}", o.name),
+                _ => format!("{}:{}", kind_slug(o.kind), o.key),
+            };
+            let w = rate(o.wakeups, window_s);
+            let p = rate(o.pkg_breaks, window_s);
+            let summary = match (o.kind, o.pid) {
+                (OffenderKind::Process, Some(pid)) => format!(
+                    "{} (pid {pid}) wakes the CPU {}, breaks package sleep {}",
+                    o.name,
+                    fmt_rate(w),
+                    fmt_rate(p)
+                ),
+                _ => format!(
+                    "{} wakes the CPU {}, breaks package sleep {}",
+                    o.name,
+                    fmt_rate(w),
+                    fmt_rate(p)
+                ),
+            };
+            Offender {
+                id,
+                kind: o.kind,
+                summary,
+                wakeups_per_s: w,
+                idle_breaks_per_s: rate(o.idle_breaks, window_s),
+                pkg_breaks_per_s: p,
+                pid: o.pid,
+                share: if total_wakeups > 0 {
+                    o.wakeups as f64 / total_wakeups as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect();
+
+    // Rank by battery cost: package-sleep breaks first, then raw wakeups.
+    // (hrtimer_wakeup dominates raw wakeups; pkg_breaks is what costs battery.)
+    rows.sort_by(|a, b| {
+        b.pkg_breaks_per_s
+            .total_cmp(&a.pkg_breaks_per_s)
+            .then(b.wakeups_per_s.total_cmp(&a.wakeups_per_s))
+    });
+    rows.truncate(limit);
+
+    Offenders {
+        schema: SCHEMA,
+        kind: "offenders".into(),
+        meta: Meta {
+            hostname: sysinfo.hostname.clone(),
+            kernel: sysinfo.kernel.clone(),
+            sampled_at_unix_ms,
+            window_s,
+            ticks: 1,
+            degraded: source.state != SourceState::Ok,
+        },
+        source: source.clone(),
+        offenders: rows,
+        observer_wakeups_per_s: Some(rate(observer_wakeups, window_s)),
+        window_ms_mean: None,
+    }
+}

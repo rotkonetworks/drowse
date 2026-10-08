@@ -4,9 +4,11 @@
 use crate::score::{FieldInfo, SysInfo};
 use crate::state::State;
 use crate::{rpc, timer_plan};
-use drowse_api::{RpcRequest, RpcResponse, Scorecard};
+use drowse_api::{OffenderKind, RpcRequest, RpcResponse, Scorecard, SourceState, SourceStatus};
 use drowse_core::service::drive;
-use drowse_core::{Collector, Engine, Field, Kind, Probe, Unit};
+use drowse_core::{
+    AttributionDelta, Collector, Engine, Field, Kind, Probe, RawOffender, Unit,
+};
 use serde_json::{json, Value};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -85,7 +87,13 @@ fn test_state() -> Arc<Mutex<State>> {
     // Battery lives in the fast fake engine here; the slow lane is exercised
     // separately in the slow_lane_* tests. Empty slow layout => no merge.
     let sysinfo = SysInfo { hostname: "testhost".into(), kernel: "6.0-test".into() };
-    Arc::new(Mutex::new(State::new(fake_engine(), Vec::new(), 10_000, sysinfo)))
+    Arc::new(Mutex::new(State::new(
+        fake_engine(),
+        Vec::new(),
+        10_000,
+        drowse_api::SourceStatus::ok(),
+        sysinfo,
+    )))
 }
 
 fn req(method: &str, params: Value) -> RpcRequest {
@@ -303,7 +311,13 @@ fn battery_slow_layout() -> Vec<FieldInfo> {
 
 fn slow_state(cadence_ms: u64) -> State {
     let sysinfo = SysInfo { hostname: "testhost".into(), kernel: "6.0-test".into() };
-    State::new(cpuidle_only_engine(), battery_slow_layout(), cadence_ms, sysinfo)
+    State::new(
+        cpuidle_only_engine(),
+        battery_slow_layout(),
+        cadence_ms,
+        drowse_api::SourceStatus::ok(),
+        sysinfo,
+    )
 }
 
 #[test]
@@ -348,4 +362,118 @@ fn slow_fresh_window_boundaries() {
     assert!(st.slow_fresh(1000)); // age 0
     assert!(st.slow_fresh(4000)); // age 3000 == threshold
     assert!(!st.slow_fresh(4001)); // age 3001 > threshold
+}
+
+// ---------------------------------------------------------------------------
+// Attribution: offenders.get ranks by battery cost (pkg_breaks), not raw
+// wakeups, and degrades to an empty-but-valid table when eBPF is unavailable.
+// ---------------------------------------------------------------------------
+
+fn attr_state(source: SourceStatus) -> State {
+    let sysinfo = SysInfo { hostname: "testhost".into(), kernel: "6.0-test".into() };
+    State::new(cpuidle_only_engine(), battery_slow_layout(), 10_000, source, sysinfo)
+}
+
+fn raw(
+    kind: OffenderKind,
+    key: &str,
+    name: &str,
+    pid: Option<u32>,
+    wakeups: u64,
+    idle_breaks: u64,
+    pkg_breaks: u64,
+) -> RawOffender {
+    RawOffender {
+        kind,
+        key: key.into(),
+        name: name.into(),
+        pid,
+        wakeups,
+        idle_breaks,
+        pkg_breaks,
+    }
+}
+
+#[test]
+fn offenders_ranked_by_pkg_breaks_not_raw_wakeups() {
+    let mut st = attr_state(SourceStatus::ok());
+    // hrtimer dominates raw wakeups but breaks no package sleep; syncthing
+    // wakes rarely but shatters all-idle windows — it must rank first.
+    let timer = raw(OffenderKind::Timer, "hrtimer_wakeup", "hrtimer_wakeup", None, 1000, 800, 0);
+    let sync = raw(OffenderKind::Process, "1663", "syncthing", Some(1663), 50, 45, 40);
+    st.publish_attribution(
+        AttributionDelta { offenders: vec![timer, sync], observer_wakeups: 5 },
+        10_000_000_000, // 10 s window
+        123_456,
+    );
+
+    let off = st.make_offenders(20);
+    assert_eq!(off.kind, "offenders");
+    assert!((off.meta.window_s - 10.0).abs() < 1e-9);
+    assert!(!off.meta.degraded);
+    assert_eq!(off.source.state, SourceState::Ok);
+
+    // Ranking: syncthing first (pkg_breaks 4/s beats hrtimer's 0), despite
+    // hrtimer having 20x the raw wakeups.
+    assert_eq!(off.offenders[0].id, "proc:1663:syncthing");
+    assert_eq!(off.offenders[0].kind, OffenderKind::Process);
+    assert_eq!(off.offenders[0].pid, Some(1663));
+    assert!((off.offenders[0].pkg_breaks_per_s - 4.0).abs() < 1e-9);
+    assert!((off.offenders[0].wakeups_per_s - 5.0).abs() < 1e-9);
+    assert!((off.offenders[0].idle_breaks_per_s - 4.5).abs() < 1e-9);
+    assert!((off.offenders[0].share - 50.0 / 1050.0).abs() < 1e-9);
+    assert!(off.offenders[0].summary.contains("syncthing"));
+    assert!(off.offenders[0].summary.contains("pid 1663"));
+
+    assert_eq!(off.offenders[1].id, "timer:hrtimer_wakeup");
+    assert_eq!(off.offenders[1].kind, OffenderKind::Timer);
+    assert_eq!(off.offenders[1].pid, None);
+    assert!((off.offenders[1].pkg_breaks_per_s - 0.0).abs() < 1e-9);
+
+    // observer row reported honestly: 5 wakeups / 10 s.
+    assert!((off.observer_wakeups_per_s.unwrap() - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn offenders_limit_truncates_after_ranking() {
+    let mut st = attr_state(SourceStatus::ok());
+    let a = raw(OffenderKind::Process, "1", "a", Some(1), 10, 0, 1);
+    let b = raw(OffenderKind::Process, "2", "b", Some(2), 10, 0, 9); // highest pkg
+    let c = raw(OffenderKind::Process, "3", "c", Some(3), 10, 0, 5);
+    st.publish_attribution(
+        AttributionDelta { offenders: vec![a, b, c], observer_wakeups: 0 },
+        1_000_000_000,
+        1,
+    );
+    let off = st.make_offenders(1);
+    assert_eq!(off.offenders.len(), 1);
+    assert_eq!(off.offenders[0].id, "proc:2:b"); // the top pkg-break survives
+}
+
+#[test]
+fn offenders_unavailable_is_empty_with_reason_not_error() {
+    // Unprivileged: eBPF load was denied; offenders.get must still answer.
+    let st = Arc::new(Mutex::new(attr_state(SourceStatus::err(
+        SourceState::PermissionDenied,
+        "attribution needs root (CAP_BPF)",
+    ))));
+    let mut svc = rpc::router(st);
+    let resp = drive(&mut svc, req("offenders.get", json!({"limit": 5})));
+    let v = result(resp); // result() asserts no RPC error
+    assert_eq!(v["kind"], "offenders");
+    assert_eq!(v["offenders"].as_array().unwrap().len(), 0);
+    assert_eq!(v["source"]["state"], "permission_denied");
+    assert_eq!(v["meta"]["degraded"], json!(true));
+}
+
+#[test]
+fn offenders_get_is_registered_and_defaults_empty() {
+    // test_state has attribution ok but no window drained yet.
+    let st = test_state();
+    let mut svc = rpc::router(st);
+    let v = result(drive(&mut svc, req("offenders.get", json!({}))));
+    assert_eq!(v["kind"], "offenders");
+    assert_eq!(v["offenders"].as_array().unwrap().len(), 0);
+    assert_eq!(v["source"]["state"], "ok");
+    assert!((v["meta"]["window_s"].as_f64().unwrap() - 0.0).abs() < 1e-9);
 }
