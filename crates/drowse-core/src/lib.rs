@@ -121,6 +121,38 @@ pub enum AttributorProbe {
 }
 
 // ---------------------------------------------------------------------------
+// Policy seam (M3): the act layer. A PolicyEngine plans, applies, and reverts
+// reversible system changes transactionally. Implementation (sysfs/cgroup/dbus
+// knobs, the journal, verify-after-apply) lives in drowse-policy; the daemon
+// owns it and exposes policy.plan/apply/revert. Kept minimal and object-safe.
+// ---------------------------------------------------------------------------
+
+/// AC vs battery — the trigger context a plan is computed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerState {
+    Battery,
+    Ac,
+}
+
+/// The act subsystem. All methods are fallible; a failed apply must leave the
+/// system restorable via the journal (replayed by `revert` or a restore unit).
+pub trait PolicyEngine: Send {
+    /// What would apply in this power state; no mutation.
+    fn plan(&self, state: PowerState) -> io::Result<drowse_api::Plan>;
+    /// Apply (or, with `dry_run`, only report) the plan, returning a txn.
+    fn apply(&mut self, state: PowerState, dry_run: bool) -> io::Result<drowse_api::ApplyResult>;
+    /// Undo a transaction by id.
+    fn revert(&mut self, txn_id: &str) -> io::Result<drowse_api::RevertResult>;
+}
+
+/// Probe outcome for the policy engine (needs privilege to apply; may be
+/// plan-only unprivileged).
+pub enum PolicyProbe {
+    Ready(Box<dyn PolicyEngine>),
+    Unavailable(drowse_api::SourceStatus),
+}
+
+// ---------------------------------------------------------------------------
 // Engine: owns buffers, ticks collectors, serves deltas.
 // ---------------------------------------------------------------------------
 

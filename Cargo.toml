@@ -5,6 +5,7 @@ members = [
     "crates/drowse-core",
     "crates/drowse-collectors",
     "crates/drowse-ebpf",
+    "crates/drowse-policy",
     "crates/drowsed",
     "crates/drowse",
 ]
@@ -22,6 +23,7 @@ drowse-api = { path = "crates/drowse-api" }
 drowse-core = { path = "crates/drowse-core" }
 drowse-collectors = { path = "crates/drowse-collectors" }
 drowse-ebpf = { path = "crates/drowse-ebpf" }
+drowse-policy = { path = "crates/drowse-policy" }
 
 [profile.release]
 lto = true

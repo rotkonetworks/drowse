@@ -1,0 +1,13 @@
+[package]
+name = "drowse-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The act layer: tiered reversible power knobs, elastic-service caps, transaction journal."
+
+[dependencies]
+drowse-api.workspace = true
+drowse-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustix.workspace = true

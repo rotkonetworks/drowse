@@ -250,6 +250,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "drowse-policy"
+version = "0.1.0"
+dependencies = [
+ "drowse-api",
+ "drowse-core",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "drowsed"
 version = "0.1.0"
 dependencies = [

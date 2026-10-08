@@ -274,6 +274,110 @@ pub struct Offenders {
     pub window_ms_mean: Option<f64>,
 }
 
+// ---------------------------------------------------------------------------
+// Policy (M3): the act layer. plan/apply/revert. Every change is reversible
+// and journaled; apply is gated and defaults to dry-run from the CLI.
+// ---------------------------------------------------------------------------
+
+/// Blast-radius tier of a knob (from the policy brief).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    /// Apply by default on battery (audio power_save, EPP/platform_profile, ABM).
+    T0,
+    /// On by default but with exclusion lists (USB autosuspend, PCI runtime PM).
+    T1,
+    /// Opt-in only — known to break some hardware (ASPM powersave, cgroup freeze).
+    T2,
+    /// Report-only, never applied at runtime (boot params: NVMe APST, pcie_aspm).
+    T3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Risk {
+    Low,
+    Medium,
+    High,
+}
+
+/// One concrete, reversible change the policy engine can make.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyAction {
+    /// Stable id an agent references across plan/apply/revert, e.g.
+    /// "knob:usb-autosuspend:1-3" or "cap:syncthing.service".
+    pub id: String,
+    /// What kind of change: "sysfs" | "cgroup" | "dbus" | "report".
+    pub kind: String,
+    /// Human one-liner: "cap syncthing to 10% CPU on battery".
+    pub summary: String,
+    pub tier: Tier,
+    pub risk: Risk,
+    pub reversible: bool,
+    /// Current value (for display / confirming the revert target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Value this action would set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Estimated battery gain, when modelable: {mid, low, high} minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub est_gain_min: Option<Estimate>,
+    /// Why this action is in (or excluded from) the plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// An honest estimate: a range plus how it was derived.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Estimate {
+    pub mid: f64,
+    pub low: f64,
+    pub high: f64,
+    /// "measured" | "modeled" | "rough".
+    pub basis: String,
+}
+
+/// Result of `policy.plan`: what would happen, nothing applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub schema: u32,
+    pub kind: String, // "plan"
+    pub on_battery: bool,
+    /// Actions that would apply, in order.
+    pub actions: Vec<PolicyAction>,
+    /// Actions excluded by tier/opt-in/quirk, each with a `note` reason.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub excluded: Vec<PolicyAction>,
+}
+
+/// Result of `policy.apply`: a transaction that `policy.revert` can undo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyResult {
+    pub schema: u32,
+    pub kind: String, // "apply"
+    /// Journal id for `policy.revert`. Present even on dry_run (then "dry-run").
+    pub txn_id: String,
+    pub dry_run: bool,
+    /// Actions actually applied (or that would be, on dry_run).
+    pub applied: Vec<PolicyAction>,
+    /// Actions attempted but rolled back (verify-after-apply caught a
+    /// regression) or refused, each with a `note`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub failed: Vec<PolicyAction>,
+}
+
+/// Result of `policy.revert`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertResult {
+    pub schema: u32,
+    pub kind: String, // "revert"
+    pub txn_id: String,
+    /// True if there was nothing to undo (already reverted / unknown txn).
+    pub already_reverted: bool,
+    pub reverted: Vec<PolicyAction>,
+}
+
 /// Default socket path for the unprivileged user instance.
 pub fn user_socket_path() -> std::path::PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
