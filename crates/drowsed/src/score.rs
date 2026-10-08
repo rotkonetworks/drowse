@@ -279,6 +279,23 @@ fn fmt_rate(r: f64) -> String {
 /// subsystem is unavailable `raw` is empty and the result is a valid, empty
 /// table — never an error.
 #[allow(clippy::too_many_arguments)]
+/// A rough, honestly-labeled battery cost for an offender, from its package-
+/// sleep-break rate. Model: each break costs ~40us of lost deep idle at a
+/// ~1.5W light-vs-deep delta; against a ~4W idle draw on a ~40Wh battery
+/// (~10h = 600min base), cost_min ≈ pkg_breaks_per_s × 0.009. The low/high
+/// span a 20–80us per-break assumption. Returns None below a noise floor.
+fn battery_cost(pkg_breaks_per_s: f64) -> Option<drowse_api::Estimate> {
+    if pkg_breaks_per_s < 5.0 {
+        return None;
+    }
+    Some(drowse_api::Estimate {
+        mid: pkg_breaks_per_s * 0.009,
+        low: pkg_breaks_per_s * 0.0045,
+        high: pkg_breaks_per_s * 0.018,
+        basis: "rough".into(),
+    })
+}
+
 pub fn offenders(
     raw: &[RawOffender],
     observer_wakeups: u64,
@@ -328,7 +345,9 @@ pub fn offenders(
                     0.0
                 },
                 // Filled by the measure->fix integration (gap #2).
-                battery_cost_min: None,
+                battery_cost_min: battery_cost(p),
+                // Linked to fixes by the offenders.get handler (which has the
+                // policy plan); the pure assembler can't see it.
                 action_ids: Vec::new(),
             }
         })

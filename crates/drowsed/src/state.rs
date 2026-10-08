@@ -89,6 +89,10 @@ pub struct AttrWindow {
     pub observer_wakeups: u64,
     pub window_ns: u64,
     pub unix_ms: u64,
+    /// Nanoseconds in this window during which all cpus were simultaneously
+    /// idle — the honest package-sleep residency (0 if the eBPF side doesn't
+    /// track it yet, in which case SE stays os-timed-mean).
+    pub all_cores_idle_ns: u64,
 }
 
 impl State {
@@ -125,6 +129,7 @@ impl State {
     /// off the sampler critical path).
     pub fn publish_attribution(&mut self, delta: AttributionDelta, window_ns: u64, unix_ms: u64) {
         self.attr = Some(AttrWindow {
+            all_cores_idle_ns: delta.all_cores_idle_ns,
             offenders: delta.offenders,
             observer_wakeups: delta.observer_wakeups,
             window_ns,
@@ -260,7 +265,22 @@ impl State {
             last.values.extend_from_slice(&self.slow_values);
         }
         let refs: Vec<&TickRecord> = merged.iter().collect();
-        score::assemble(&self.combined_layout, &refs, &self.engine.unavailable, &self.sysinfo)
+        let mut card =
+            score::assemble(&self.combined_layout, &refs, &self.engine.unavailable, &self.sysinfo);
+        // Honest SE (gap #1): if eBPF attribution measured all-cores-idle time,
+        // SE is that residency over the window — the fraction of time the whole
+        // package was asleep — not the per-CPU mean. Falls back automatically
+        // when the residency isn't tracked (0) or no window has been drained.
+        if let Some(w) = &self.attr
+            && w.all_cores_idle_ns > 0
+            && w.window_ns > 0
+        {
+            let se = (w.all_cores_idle_ns as f64 / w.window_ns as f64 * 100.0).clamp(0.0, 100.0);
+            card.score.sleep_efficiency = Some(se);
+            card.score.grade = Some(drowse_api::Grade::from_se(se));
+            card.score.basis = "pkg-idle-window".into();
+        }
+        card
     }
 
     /// Params for the per-tick "tick" notification, from the latest record.

@@ -283,11 +283,15 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) -> Router
     });
 
     let s = st.clone();
+    let p = policy.clone();
     let offenders_get = handler(move |q: RpcRequest| {
         let limit = p_u64(&q.params, "limit").unwrap_or(DEFAULT_OFFENDER_LIMIT) as usize;
         // `window_s` is accepted for API symmetry; the effective window is the
         // last drain's, reported truthfully in meta.window_s.
-        let off = s.lock().unwrap().make_offenders(limit);
+        let mut off = s.lock().unwrap().make_offenders(limit);
+        // Close the measure->fix loop (gap #2): link each process offender to a
+        // policy cap action for its systemd unit, if the battery plan has one.
+        link_offenders_to_fixes(&mut off, &p);
         RpcResponse::ok(q.id, serde_json::to_value(off).unwrap())
     });
 
@@ -406,6 +410,54 @@ pub fn router(st: Arc<Mutex<State>>, policy: Arc<Mutex<PolicyHandle>>) -> Router
         .route("power.status", power_status)
         .route("power.toggle", power_toggle)
         .route("subscribe", subscribe)
+}
+
+/// The systemd unit owning a pid, read from its cgroup line
+/// (`0::/system.slice/foo.service` or `.../app.slice/…/foo.service`). None for
+/// processes not in a `*.service` cgroup.
+fn unit_of_pid(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    for line in text.lines() {
+        let path = line.rsplit_once("::").map(|(_, p)| p).unwrap_or(line);
+        for seg in path.split('/').rev() {
+            if seg.ends_with(".service") || seg.ends_with(".scope") || seg.ends_with(".slice") {
+                return Some(seg.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Attach policy `cap:<unit>` action ids to process offenders whose systemd
+/// unit the current battery plan would cap. Briefly locks the policy mutex.
+fn link_offenders_to_fixes(off: &mut drowse_api::Offenders, policy: &Arc<Mutex<PolicyHandle>>) {
+    // Collect the cap action ids the battery plan offers: "cap:<unit>".
+    let cap_ids: std::collections::HashMap<String, String> = {
+        let g = policy.lock().unwrap();
+        match &g.engine {
+            Policy::Ready(engine) => match engine.plan(PowerState::Battery) {
+                Ok(plan) => plan
+                    .actions
+                    .into_iter()
+                    .chain(plan.excluded)
+                    .filter_map(|a| a.id.strip_prefix("cap:").map(|u| (u.to_string(), a.id.clone())))
+                    .collect(),
+                Err(_) => return,
+            },
+            Policy::Unavailable(_) => return,
+        }
+    };
+    if cap_ids.is_empty() {
+        return;
+    }
+    for o in &mut off.offenders {
+        if let Some(pid) = o.pid
+            && let Some(unit) = unit_of_pid(pid)
+            && let Some(action_id) = cap_ids.get(&unit)
+        {
+            o.action_ids.push(action_id.clone());
+        }
+    }
 }
 
 /// Assemble a [`PowerStatus`] from the sampler state and the policy handle.
