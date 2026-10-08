@@ -327,6 +327,9 @@ pub fn offenders(
                 } else {
                     0.0
                 },
+                // Filled by the measure->fix integration (gap #2).
+                battery_cost_min: None,
+                action_ids: Vec::new(),
             }
         })
         .collect();

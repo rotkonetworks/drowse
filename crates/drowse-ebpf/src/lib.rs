@@ -257,7 +257,10 @@ impl Attributor for EbpfAttributor {
         self.prev_observer = observer_total;
 
         let _ = self.ncpus; // kept for future rate/window math
-        Ok(AttributionDelta { offenders, observer_wakeups })
+        // all-cores-idle residency (gap #1, honest SE) — 0 until the BPF side
+        // tracks it; the daemon falls back to os-timed-mean while this is 0.
+        let all_cores_idle_ns = 0u64;
+        Ok(AttributionDelta { offenders, observer_wakeups, all_cores_idle_ns })
     }
 }
 

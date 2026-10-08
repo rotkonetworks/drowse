@@ -105,6 +105,10 @@ pub struct AttributionDelta {
     pub offenders: Vec<RawOffender>,
     /// Drowse's own wakeups over the interval, kept honest.
     pub observer_wakeups: u64,
+    /// Nanoseconds in this interval during which ALL cpus were simultaneously
+    /// idle — the honest package-sleep residency. 0 when the implementation
+    /// doesn't track it (the daemon then falls back to os-timed-mean SE).
+    pub all_cores_idle_ns: u64,
 }
 
 /// A running wakeup-attribution subsystem. `drain` returns the counts since the

@@ -412,7 +412,7 @@ fn offenders_ranked_by_pkg_breaks_not_raw_wakeups() {
     let timer = raw(OffenderKind::Timer, "hrtimer_wakeup", "hrtimer_wakeup", None, 1000, 800, 0);
     let sync = raw(OffenderKind::Process, "1663", "syncthing", Some(1663), 50, 45, 40);
     st.publish_attribution(
-        AttributionDelta { offenders: vec![timer, sync], observer_wakeups: 5 },
+        AttributionDelta { offenders: vec![timer, sync], observer_wakeups: 5, all_cores_idle_ns: 0 },
         10_000_000_000, // 10 s window
         123_456,
     );
@@ -451,7 +451,7 @@ fn offenders_limit_truncates_after_ranking() {
     let b = raw(OffenderKind::Process, "2", "b", Some(2), 10, 0, 9); // highest pkg
     let c = raw(OffenderKind::Process, "3", "c", Some(3), 10, 0, 5);
     st.publish_attribution(
-        AttributionDelta { offenders: vec![a, b, c], observer_wakeups: 0 },
+        AttributionDelta { offenders: vec![a, b, c], observer_wakeups: 0, all_cores_idle_ns: 0 },
         1_000_000_000,
         1,
     );

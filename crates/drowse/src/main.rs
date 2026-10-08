@@ -1023,6 +1023,8 @@ mod tests {
             pkg_breaks_per_s: pkg,
             pid,
             share,
+            battery_cost_min: None,
+            action_ids: Vec::new(),
         }
     }
 

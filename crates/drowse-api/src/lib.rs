@@ -253,6 +253,14 @@ pub struct Offender {
     pub pid: Option<u32>,
     /// Share of total attributed wakeups, 0..1.
     pub share: f64,
+    /// Modeled battery cost of this offender, in minutes off a charge. Closes
+    /// the measure->fix loop with a priced "so what". Null when unmodelable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_cost_min: Option<Estimate>,
+    /// Policy action ids that would mitigate this offender (e.g. the elastic
+    /// cap for a process in a capped unit). Empty when no fix is known.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub action_ids: Vec<String>,
 }
 
 /// Result of `offenders.get`.
@@ -376,6 +384,26 @@ pub struct RevertResult {
     /// True if there was nothing to undo (already reverted / unknown txn).
     pub already_reverted: bool,
     pub reverted: Vec<PolicyAction>,
+}
+
+/// Result of `power.status` — the compact state a status bar renders and a
+/// one-click toggle acts on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerStatus {
+    pub schema: u32,
+    pub kind: String, // "power_status"
+    /// Whether the machine is currently on battery.
+    pub on_battery: bool,
+    /// Whether drowse's battery power-save plan is currently applied.
+    pub power_save_active: bool,
+    /// The transaction holding the applied plan, when active (for revert).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_txn_id: Option<String>,
+    /// Latest Sleep Efficiency + grade, when a measurement is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep_efficiency: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grade: Option<Grade>,
 }
 
 /// Default socket path for the unprivileged user instance.
