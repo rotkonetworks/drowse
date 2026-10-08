@@ -56,6 +56,7 @@ def main():
         "pkg_w": round(score.get("package_power_w"), 3) if score.get("package_power_w") is not None else None,
         "se": round(sc.get("sleep_efficiency"), 1) if sc.get("sleep_efficiency") is not None else None,
         "grade": sc.get("grade"),
+        "soc": status.get("battery_pct"),  # charge %, for the real discharge curve
     }
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     with open(LOG, "a") as f:
