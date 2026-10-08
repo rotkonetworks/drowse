@@ -4,6 +4,7 @@ members = [
     "crates/drowse-api",
     "crates/drowse-core",
     "crates/drowse-collectors",
+    "crates/drowse-ebpf",
     "crates/drowsed",
     "crates/drowse",
 ]

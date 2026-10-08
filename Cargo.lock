@@ -45,6 +45,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "drowse-ebpf"
+version = "0.1.0"
+dependencies = [
+ "drowse-api",
+ "drowse-core",
+]
+
+[[package]]
 name = "drowsed"
 version = "0.1.0"
 dependencies = [

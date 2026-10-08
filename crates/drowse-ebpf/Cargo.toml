@@ -1,0 +1,11 @@
+[package]
+name = "drowse-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "eBPF wakeup attribution: in-kernel blame counting, drained on a slow cadence."
+
+[dependencies]
+drowse-api.workspace = true
+drowse-core.workspace = true
+# libbpf-rs / libbpf-cargo added by the attribution implementation.

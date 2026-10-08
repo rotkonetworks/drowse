@@ -211,6 +211,69 @@ impl RpcResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attribution: the M2 payload of `offenders.get`.
+// ---------------------------------------------------------------------------
+
+/// What woke the CPU. Attribution resolves the blame chain to one of these at
+/// the moment of `sched_waking` (or a timer/irq firing with no resulting task).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffenderKind {
+    /// A userspace task (process/thread) woke the CPU.
+    Process,
+    /// A timer callback fired (hrtimer or timer); `name` is the callback symbol.
+    Timer,
+    /// A hardware IRQ; `name` is the IRQ line / handler.
+    Irq,
+    /// A softirq (net rx/tx, rcu, sched); `name` is the vector.
+    Softirq,
+    /// A workqueue item; `name` is the work function symbol.
+    Workqueue,
+}
+
+/// One row of the wakeup-attribution table, aggregated over the window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Offender {
+    /// Stable id an agent can reference across calls, e.g. "proc:1663:chromium"
+    /// or "timer:tick_sched_timer".
+    pub id: String,
+    pub kind: OffenderKind,
+    /// Human one-liner: "wakes the CPU 312x/s (timer storm, 3 threads)".
+    pub summary: String,
+    /// Wakeups per second this offender caused over the window.
+    pub wakeups_per_s: f64,
+    /// Of those, the rate that interrupted an already-idle CPU.
+    pub idle_breaks_per_s: f64,
+    /// Of those, the rate that broke a window where ALL cpus were idle — the
+    /// package-sleep breaks, the ones that actually cost battery.
+    pub pkg_breaks_per_s: f64,
+    /// pid/tgid for Process kind; None otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Share of total attributed wakeups, 0..1.
+    pub share: f64,
+}
+
+/// Result of `offenders.get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Offenders {
+    pub schema: u32,
+    pub kind: String, // "offenders"
+    pub meta: Meta,
+    /// Availability of the attribution subsystem itself (needs CAP_BPF).
+    pub source: SourceStatus,
+    /// Ranked most-costly first (by pkg_breaks_per_s, then wakeups_per_s).
+    pub offenders: Vec<Offender>,
+    /// Drowse's own wakeups, reported honestly as its own row's rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observer_wakeups_per_s: Option<f64>,
+    /// Package-idle window stats over the measurement: windows/s and the
+    /// mean/p95 window length in milliseconds (null until M2 histogram lands).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms_mean: Option<f64>,
+}
+
 /// Default socket path for the unprivileged user instance.
 pub fn user_socket_path() -> std::path::PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")

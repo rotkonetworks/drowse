@@ -80,6 +80,47 @@ pub enum Probe {
 }
 
 // ---------------------------------------------------------------------------
+// Attribution seam (M2): a long-running in-kernel counter, drained on a slow
+// cadence. NOT a Collector — it is not pread-per-tick sampling. The daemon
+// owns rate conversion, ranking, and id assignment; the implementation (eBPF,
+// in drowse-ebpf) owns kernel attribution and symbol resolution.
+// ---------------------------------------------------------------------------
+
+/// One drained attribution bucket: counts accumulated since the last drain.
+pub struct RawOffender {
+    pub kind: drowse_api::OffenderKind,
+    /// Stable identity within kind (pid as text, callback symbol, irq line).
+    pub key: String,
+    /// Display name: comm, symbol, or irq handler.
+    pub name: String,
+    pub pid: Option<u32>,
+    /// Deltas since the last drain.
+    pub wakeups: u64,
+    pub idle_breaks: u64,
+    pub pkg_breaks: u64,
+}
+
+/// Everything drained in one pass.
+pub struct AttributionDelta {
+    pub offenders: Vec<RawOffender>,
+    /// Drowse's own wakeups over the interval, kept honest.
+    pub observer_wakeups: u64,
+}
+
+/// A running wakeup-attribution subsystem. `drain` returns the counts since the
+/// previous call; the daemon divides by elapsed time for rates. Draining is
+/// the only userspace/kernel crossing — no per-event traffic.
+pub trait Attributor: Send {
+    fn drain(&mut self) -> io::Result<AttributionDelta>;
+}
+
+/// Probe outcome for attribution (needs CAP_BPF + a BTF kernel).
+pub enum AttributorProbe {
+    Ready(Box<dyn Attributor>),
+    Unavailable(drowse_api::SourceStatus),
+}
+
+// ---------------------------------------------------------------------------
 // Engine: owns buffers, ticks collectors, serves deltas.
 // ---------------------------------------------------------------------------
 
