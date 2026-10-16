@@ -2,6 +2,7 @@
 name = "drowsed"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "The drowse daemon: sampler + JSON-RPC control socket."
 

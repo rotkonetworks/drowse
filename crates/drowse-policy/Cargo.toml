@@ -2,6 +2,7 @@
 name = "drowse-policy"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "The act layer: tiered reversible power knobs, elastic-service caps, transaction journal."
 

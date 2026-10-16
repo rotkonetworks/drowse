@@ -2,6 +2,7 @@
 name = "drowse-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Collector trait, sampling engine, and the sync service stack."
 

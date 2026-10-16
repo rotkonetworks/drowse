@@ -2,6 +2,7 @@
 name = "drowse"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "The drowse CLI: agent-first client for drowsed."
 

@@ -22,7 +22,7 @@ to never perturb the idle it measures.
 
 ## Install / build
 
-Needs Rust 1.98+ (edition 2024). The eBPF attribution additionally needs, at
+Needs Rust 1.88+ (edition 2024). The eBPF attribution additionally needs, at
 build time, `clang` and `bpftool` (Arch: `pacman -S bpf`); a committed
 `vmlinux.h` means no kernel headers are required. Loading eBPF needs a BTF
 kernel and root (see below).
